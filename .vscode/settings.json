@@ -11,7 +11,9 @@
     "IDF_TARGET": "esp32s3"
   },
   "files.associations": {
-    "sdkconfig.h": "c"
+    "sdkconfig.h": "c",
+    "max3010x.h": "c",
+    "max30102_algorithms.h": "c"
   },
   "idf.flashType": "UART"
 }
