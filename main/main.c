@@ -50,7 +50,7 @@ static const char *TAG = "NirogScan";
 #define MAX17048_REG_VCELL            0x02
 #define MAX17048_REG_SOC              0x04
 
-#define SAMPLE_RATE_HZ                128
+#define SAMPLE_RATE_HZ                50
 #define TIMER_PERIOD_US               (1000000 / SAMPLE_RATE_HZ)
 
 #define PPG_READY_BIT                 BIT0
@@ -224,7 +224,7 @@ static void ecg_task(void *pvParameters) {
 
         sensor_data.timestamp = esp_timer_get_time() / 1000;
 
-        printf("%d,%lu,%lu,%.2f,%.1f,%d,%d\n",
+        printf(">ecg:%d,ir:%lu,red:%lu,%.2f,%.1f,%d,%d\n",
             // (unsigned long)sensor_data.timestamp,
             sensor_data.ecg,
             (unsigned long)sensor_data.ir,
