@@ -52,9 +52,11 @@ static const char *TAG = "NirogScan";
 #define MAX17048_REG_VCELL            0x02
 #define MAX17048_REG_SOC              0x04
 
-#define SAMPLE_RATE_HZ                25
-#define TIMER_PERIOD_US               (1000000 / SAMPLE_RATE_HZ)
-#define ALGORITHM_BUFFER_SIZE         100
+#define PPG_SAMPLE_RATE_HZ            64
+#define ECG_SAMPLE_RATE_HZ            50
+#define PPG_TIMER_PERIOD_US           (1000000 / PPG_SAMPLE_RATE_HZ)
+#define ECG_TIMER_PERIOD_US           (1000000 / ECG_SAMPLE_RATE_HZ)
+#define ALGORITHM_BUFFER_SIZE         256
 
 #define PPG_READY_BIT                 BIT0
 #define ECG_READY_BIT                 BIT1
@@ -107,7 +109,8 @@ typedef struct {
 static adc_oneshot_unit_handle_t adc1_handle;
 static sensor_data_t sensor_data = {0};
 static EventGroupHandle_t sync_event_group;
-static esp_timer_handle_t periodic_timer;
+static esp_timer_handle_t ppg_timer;
+static esp_timer_handle_t ecg_timer;
 static volatile uint32_t battery_counter = 0;
 
 static uint32_t red_buffer[ALGORITHM_BUFFER_SIZE];
@@ -236,7 +239,7 @@ static void calculate_spo2(uint32_t *ir_buf, uint32_t *red_buf, int32_t buf_len,
     result->spo2_value = -999;
     result->heart_rate = -999;
     
-    if (buf_len < 50) return;
+    if (buf_len < 100) return;
     
     uint32_t ir_mean = 0, red_mean = 0;
     for (int i = 0; i < buf_len; i++) {
@@ -282,7 +285,7 @@ static esp_err_t max30101_init(void) {
     ESP_RETURN_ON_ERROR(max30101_write_reg(MAX30101_REG_FIFO_RD_PTR, 0x00), TAG, "RD PTR failed");
     ESP_RETURN_ON_ERROR(max30101_write_reg(MAX30101_REG_FIFO_CONFIG, 0x4F), TAG, "FIFO config failed");
     ESP_RETURN_ON_ERROR(max30101_write_reg(MAX30101_REG_MODE_CONFIG, 0x03), TAG, "Mode config failed");
-    ESP_RETURN_ON_ERROR(max30101_write_reg(MAX30101_REG_SPO2_CONFIG, 0x21), TAG, "SpO2 config failed");
+    ESP_RETURN_ON_ERROR(max30101_write_reg(MAX30101_REG_SPO2_CONFIG, 0x24), TAG, "SpO2 config failed");
     ESP_RETURN_ON_ERROR(max30101_write_reg(MAX30101_REG_LED1_PA, 0x24), TAG, "LED1 failed");
     ESP_RETURN_ON_ERROR(max30101_write_reg(MAX30101_REG_LED2_PA, 0x24), TAG, "LED2 failed");
 
@@ -322,9 +325,17 @@ static void gpio_init_all(void) {
     gpio_config(&io_conf);
 }
 
-static void IRAM_ATTR periodic_timer_callback(void* arg) {
+static void IRAM_ATTR ppg_timer_callback(void* arg) {
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xEventGroupSetBitsFromISR(sync_event_group, PPG_READY_BIT | ECG_READY_BIT, &xHigherPriorityTaskWoken);
+    xEventGroupSetBitsFromISR(sync_event_group, PPG_READY_BIT, &xHigherPriorityTaskWoken);
+    if (xHigherPriorityTaskWoken) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+static void IRAM_ATTR ecg_timer_callback(void* arg) {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xEventGroupSetBitsFromISR(sync_event_group, ECG_READY_BIT, &xHigherPriorityTaskWoken);
     if (xHigherPriorityTaskWoken) {
         portYIELD_FROM_ISR();
     }
@@ -359,7 +370,7 @@ static void ppg_task(void *pvParameters) {
                         check_for_beat((int32_t)ir);
                         
                         sample_count++;
-                        if (sample_count % 25 == 0 && sample_count > 100) {
+                        if (sample_count % 64 == 0 && sample_count > 192) {
                             spo2_result_t result;
                             calculate_spo2(ir_buffer, red_buffer, ALGORITHM_BUFFER_SIZE, &result);
                             
@@ -370,6 +381,8 @@ static void ppg_task(void *pvParameters) {
                                 sensor_data.spo2_valid = 0;
                             }
                         }
+                    } else {
+                        sensor_data.spo2_valid = 0;
                     }
                 }
             }
@@ -380,6 +393,7 @@ static void ppg_task(void *pvParameters) {
 static void ecg_task(void *pvParameters) {
     int adc_raw;
     uint16_t vcell, soc;
+    static uint32_t ecg_sample_count = 0;
 
     while (1) {
         xEventGroupWaitBits(sync_event_group, ECG_READY_BIT, pdTRUE, pdFALSE, portMAX_DELAY);
@@ -391,8 +405,10 @@ static void ecg_task(void *pvParameters) {
             sensor_data.ecg = adc_raw;
         }
 
+        ecg_sample_count++;
+        
         battery_counter++;
-        if (battery_counter >= 128) {
+        if (battery_counter >= 256) {
             battery_counter = 0;
             if (max17048_read_reg(MAX17048_REG_VCELL, &vcell) == ESP_OK &&
                 max17048_read_reg(MAX17048_REG_SOC, &soc) == ESP_OK) {
@@ -401,32 +417,34 @@ static void ecg_task(void *pvParameters) {
             }
         }
 
-        if (sensor_data.spo2_valid) {
-            printf(">ecg:%d,ir:%lu,red:%lu,spo2:%ld,%.2f,%.1f,%d,%d\n",
-                sensor_data.ecg,
-                (unsigned long)sensor_data.ir,
-                (unsigned long)sensor_data.red,
-                sensor_data.spo2,
-                sensor_data.battery_voltage,
-                sensor_data.battery_percent,
-                sensor_data.lo_minus,
-                sensor_data.lo_plus);
-        } else {
-            printf(">ecg:%d,ir:%lu,red:%lu,%.2f,%.1f,%d,%d\n",
-                sensor_data.ecg,
-                (unsigned long)sensor_data.ir,
-                (unsigned long)sensor_data.red,
-                sensor_data.battery_voltage,
-                sensor_data.battery_percent,
-                sensor_data.lo_minus,
-                sensor_data.lo_plus);
+        if (ecg_sample_count % 2 == 0) {
+            if (sensor_data.spo2_valid) {
+                printf(">ecg:%d,ir:%lu,red:%lu,spo2:%ld,%.2f,%.1f,%d,%d\n",
+                    sensor_data.ecg,
+                    (unsigned long)sensor_data.ir,
+                    (unsigned long)sensor_data.red,
+                    sensor_data.spo2,
+                    sensor_data.battery_voltage,
+                    sensor_data.battery_percent,
+                    sensor_data.lo_minus,
+                    sensor_data.lo_plus);
+            } else {
+                printf(">ecg:%d,ir:%lu,red:%lu,%.2f,%.1f,%d,%d\n",
+                    sensor_data.ecg,
+                    (unsigned long)sensor_data.ir,
+                    (unsigned long)sensor_data.red,
+                    sensor_data.battery_voltage,
+                    sensor_data.battery_percent,
+                    sensor_data.lo_minus,
+                    sensor_data.lo_plus);
+            }
         }
     }
 }
 
 void app_main(void) {
     LOG_I(TAG, "NirogScan Lite Starting...");
-    LOG_I(TAG, "Sample Rate: %d Hz", SAMPLE_RATE_HZ);
+    LOG_I(TAG, "PPG Sample Rate: %d Hz, ECG Sample Rate: %d Hz", PPG_SAMPLE_RATE_HZ, ECG_SAMPLE_RATE_HZ);
 
     sync_event_group = xEventGroupCreate();
     if (sync_event_group == NULL) {
@@ -459,20 +477,29 @@ void app_main(void) {
         return;
     }
 
-    LOG_I(TAG, "All sensors initialized with HR/SpO2 algorithms");
+    LOG_I(TAG, "All sensors initialized with dual sample rates");
 
     printf("ecg,ir,red,spo2(optional),battery_v,battery_percent,lo_minus,lo_plus\n");
 
     xTaskCreatePinnedToCore(ppg_task, "ppg_task", 8192, NULL, 10, NULL, 0);
-    xTaskCreatePinnedToCore(ecg_task, "ecg_task", 4096, NULL, 10, NULL, 1);
+    xTaskCreatePinnedToCore(ecg_task, "ecg_task", 4096, NULL, 9, NULL, 1);
 
-    const esp_timer_create_args_t periodic_timer_args = {
-        .callback = &periodic_timer_callback,
-        .name = "periodic"
+    const esp_timer_create_args_t ppg_timer_args = {
+        .callback = &ppg_timer_callback,
+        .name = "ppg_timer"
     };
 
-    ESP_ERROR_CHECK(esp_timer_create(&periodic_timer_args, &periodic_timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(periodic_timer, TIMER_PERIOD_US));
+    const esp_timer_create_args_t ecg_timer_args = {
+        .callback = &ecg_timer_callback,
+        .name = "ecg_timer"
+    };
 
-    LOG_I(TAG, "All tasks started with HR/SpO2 calculation at %d Hz", SAMPLE_RATE_HZ);
+    ESP_ERROR_CHECK(esp_timer_create(&ppg_timer_args, &ppg_timer));
+    ESP_ERROR_CHECK(esp_timer_create(&ecg_timer_args, &ecg_timer));
+    
+    ESP_ERROR_CHECK(esp_timer_start_periodic(ppg_timer, PPG_TIMER_PERIOD_US));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(ecg_timer, ECG_TIMER_PERIOD_US));
+
+    LOG_I(TAG, "Started: PPG @ %d Hz, ECG @ %d Hz with HR/SpO2 algorithms", 
+          PPG_SAMPLE_RATE_HZ, ECG_SAMPLE_RATE_HZ);
 }
