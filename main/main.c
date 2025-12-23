@@ -1,28 +1,3 @@
-/**
- * @file nirog_scan_optimized.c
- * @brief ESP32S3 Multi-Sensor Data Acquisition System
- * 
- * HARDWARE CONFIGURATION:
- * - MAX30101: PPG sensor (I2C: SDA=8, SCL=9)
- * - AD8232: ECG sensor (ADC1_CH1=GPIO2, LO+=GPIO16, LO-=GPIO17)
- * - MAX17048: Fuel gauge (I2C: SDA=8, SCL=9)
- * 
- * OUTPUT FORMATS:
- * 1. PACKET FORMAT (OUTPUT_FORMAT_PACKET):
- *    PKT>seq:123,ppg_red:45678,12345,ppg_ir:54321,23456,ecg:2048,2056,2044,2052,2048,lo:0,0,0,0,0,batt_v:3.756,batt_soc:78.5,temp:36.45,t_start:1234567890,t_end:1234567895
- * 
- * 2. APP FORMAT (OUTPUT_FORMAT_APP):
- *    >A1:45678,12345,A2:54321,23456,A3:2048,2056,2044,2052,2048,A4:0,0,0,0,0,A5:3.756,A6:78.5,A7:36.45,A8:123,A9:1234567890,A10:1234567895
- *    Where: A1=PPG_Red, A2=PPG_IR, A3=ECG, A4=LO_Status, A5=Battery_V, A6=Battery_SOC, A7=Temp, A8=Sequence, A9=StartTime, A10=EndTime
- * 
- * TIMING CONFIGURATION:
- * - PPG: 50Hz (2 samples per packet)
- * - ECG: 125Hz (5 samples per packet)  
- * - Packet Rate: 25Hz (40ms intervals)
- * 
- * TO CHANGE OUTPUT FORMAT: Modify OUTPUT_FORMAT define below
- */
-
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
