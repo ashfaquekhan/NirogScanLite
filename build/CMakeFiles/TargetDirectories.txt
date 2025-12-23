@@ -558,6 +558,7 @@ C:/Users/ashfa/NirogScanLite/build/esp-idf/esp_wifi/CMakeFiles/list_install_comp
 C:/Users/ashfa/NirogScanLite/build/esp-idf/esp_wifi/CMakeFiles/install.dir
 C:/Users/ashfa/NirogScanLite/build/esp-idf/esp_wifi/CMakeFiles/install/local.dir
 C:/Users/ashfa/NirogScanLite/build/esp-idf/esp_wifi/CMakeFiles/install/strip.dir
+C:/Users/ashfa/NirogScanLite/build/esp-idf/bt/CMakeFiles/__idf_bt.dir
 C:/Users/ashfa/NirogScanLite/build/esp-idf/bt/CMakeFiles/edit_cache.dir
 C:/Users/ashfa/NirogScanLite/build/esp-idf/bt/CMakeFiles/rebuild_cache.dir
 C:/Users/ashfa/NirogScanLite/build/esp-idf/bt/CMakeFiles/list_install_components.dir
@@ -693,6 +694,7 @@ C:/Users/ashfa/NirogScanLite/build/esp-idf/esp_https_server/CMakeFiles/list_inst
 C:/Users/ashfa/NirogScanLite/build/esp-idf/esp_https_server/CMakeFiles/install.dir
 C:/Users/ashfa/NirogScanLite/build/esp-idf/esp_https_server/CMakeFiles/install/local.dir
 C:/Users/ashfa/NirogScanLite/build/esp-idf/esp_https_server/CMakeFiles/install/strip.dir
+C:/Users/ashfa/NirogScanLite/build/esp-idf/esp_psram/CMakeFiles/__idf_esp_psram.dir
 C:/Users/ashfa/NirogScanLite/build/esp-idf/esp_psram/CMakeFiles/edit_cache.dir
 C:/Users/ashfa/NirogScanLite/build/esp-idf/esp_psram/CMakeFiles/rebuild_cache.dir
 C:/Users/ashfa/NirogScanLite/build/esp-idf/esp_psram/CMakeFiles/list_install_components.dir

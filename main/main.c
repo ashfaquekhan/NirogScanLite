@@ -1,321 +1,268 @@
+/**
+ * @file nirog_scan_optimized.c
+ * @brief ESP32S3 Multi-Sensor Data Acquisition System
+ * 
+ * HARDWARE CONFIGURATION:
+ * - MAX30101: PPG sensor (I2C: SDA=8, SCL=9)
+ * - AD8232: ECG sensor (ADC1_CH1=GPIO2, LO+=GPIO16, LO-=GPIO17)
+ * - MAX17048: Fuel gauge (I2C: SDA=8, SCL=9)
+ * 
+ * OUTPUT FORMATS:
+ * 1. PACKET FORMAT (OUTPUT_FORMAT_PACKET):
+ *    PKT>seq:123,ppg_red:45678,12345,ppg_ir:54321,23456,ecg:2048,2056,2044,2052,2048,lo:0,0,0,0,0,batt_v:3.756,batt_soc:78.5,temp:36.45,t_start:1234567890,t_end:1234567895
+ * 
+ * 2. APP FORMAT (OUTPUT_FORMAT_APP):
+ *    >A1:45678,12345,A2:54321,23456,A3:2048,2056,2044,2052,2048,A4:0,0,0,0,0,A5:3.756,A6:78.5,A7:36.45,A8:123,A9:1234567890,A10:1234567895
+ *    Where: A1=PPG_Red, A2=PPG_IR, A3=ECG, A4=LO_Status, A5=Battery_V, A6=Battery_SOC, A7=Temp, A8=Sequence, A9=StartTime, A10=EndTime
+ * 
+ * TIMING CONFIGURATION:
+ * - PPG: 50Hz (2 samples per packet)
+ * - ECG: 125Hz (5 samples per packet)  
+ * - Packet Rate: 25Hz (40ms intervals)
+ * 
+ * TO CHANGE OUTPUT FORMAT: Modify OUTPUT_FORMAT define below
+ */
+
 #include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/event_groups.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "driver/i2c.h"
 #include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_timer.h"
 #include "esp_log.h"
-#include "esp_system.h"
-#include "esp_heap_caps.h"
+#include "esp_err.h"
 #include "esp_check.h"
-#include <inttypes.h>
-#include <string.h>
-
-#define ENABLE_LOGS 1
 
 static const char *TAG = "NirogScan";
 
-#define I2C_MASTER_SCL_IO_0           9
-#define I2C_MASTER_SDA_IO_0           8
-#define I2C_MASTER_FREQ_HZ_0          400000
-#define I2C_MASTER_NUM_0              I2C_NUM_0
+#define I2C_MASTER_SCL_IO           9
+#define I2C_MASTER_SDA_IO           8
+#define I2C_MASTER_FREQ_HZ          400000
+#define I2C_MASTER_NUM              I2C_NUM_0
+#define I2C_MASTER_TIMEOUT_MS       100
 
-#define I2C_MASTER_SCL_IO_1           11
-#define I2C_MASTER_SDA_IO_1           10
-#define I2C_MASTER_FREQ_HZ_1          400000
-#define I2C_MASTER_NUM_1              I2C_NUM_1
+#define MAX30101_I2C_ADDR           0x57
+#define MAX17048_I2C_ADDR           0x36
 
-#define MAX30101_I2C_ADDR             0x57
-#define MAX17048_I2C_ADDR             0x36
+#define ECG_ADC_CHANNEL             ADC_CHANNEL_1
+#define ECG_ADC_ATTEN               ADC_ATTEN_DB_12
+#define ECG_ADC_BITWIDTH            ADC_BITWIDTH_12
+#define ECG_GPIO_NUM                GPIO_NUM_2
+#define LO_PLUS_PIN                 GPIO_NUM_16
+#define LO_MINUS_PIN                GPIO_NUM_17
 
-#define ECG_ADC_CHANNEL               ADC_CHANNEL_1
-#define ECG_ADC_ATTEN                 ADC_ATTEN_DB_12
-#define ECG_GPIO_NUM                  GPIO_NUM_2
+#define MAX30101_REG_FIFO_WR_PTR    0x04
+#define MAX30101_REG_FIFO_RD_PTR    0x06
+#define MAX30101_REG_FIFO_DATA      0x07
+#define MAX30101_REG_FIFO_CONFIG    0x08
+#define MAX30101_REG_MODE_CONFIG    0x09
+#define MAX30101_REG_SPO2_CONFIG    0x0A
+#define MAX30101_REG_LED1_PA        0x0C
+#define MAX30101_REG_LED2_PA        0x0D
+#define MAX30101_REG_TEMP_INT       0x1F
+#define MAX30101_REG_TEMP_FRAC      0x20
+#define MAX30101_REG_TEMP_CONFIG    0x21
+#define MAX30101_REG_PART_ID        0xFF
 
-#define LO_PLUS_PIN                   GPIO_NUM_16
-#define LO_MINUS_PIN                  GPIO_NUM_17
+#define MAX17048_REG_VCELL          0x02
+#define MAX17048_REG_SOC            0x04
 
-#define MAX30101_REG_FIFO_WR_PTR      0x04
-#define MAX30101_REG_FIFO_OVF_COUNTER 0x05
-#define MAX30101_REG_FIFO_RD_PTR      0x06
-#define MAX30101_REG_FIFO_DATA        0x07
-#define MAX30101_REG_FIFO_CONFIG      0x08
-#define MAX30101_REG_MODE_CONFIG      0x09
-#define MAX30101_REG_SPO2_CONFIG      0x0A
-#define MAX30101_REG_LED1_PA          0x0C
-#define MAX30101_REG_LED2_PA          0x0D
-#define MAX30101_REG_LED3_PA          0x0E
-#define MAX30101_REG_PART_ID          0xFF
+#define PPG_SAMPLE_RATE_HZ          50
+#define ECG_SAMPLE_RATE_HZ          125
+#define PPG_TIMER_PERIOD_US         20000
+#define ECG_TIMER_PERIOD_US         8000
+#define PACKET_TIMER_PERIOD_US      40000
 
-#define MAX17048_REG_VCELL            0x02
-#define MAX17048_REG_SOC              0x04
+#define PPG_SAMPLES_PER_PACKET      2
+#define ECG_SAMPLES_PER_PACKET      5
 
-#define PPG_SAMPLE_RATE_HZ            64
-#define ECG_SAMPLE_RATE_HZ            50
-#define PPG_TIMER_PERIOD_US           (1000000 / PPG_SAMPLE_RATE_HZ)
-#define ECG_TIMER_PERIOD_US           (1000000 / ECG_SAMPLE_RATE_HZ)
-#define ALGORITHM_BUFFER_SIZE         256
+#define QUEUE_SIZE                  16
 
-#define PPG_READY_BIT                 BIT0
-#define ECG_READY_BIT                 BIT1
-
-#if ENABLE_LOGS
-    #define LOG_I(tag, format, ...) ESP_LOGI(tag, format, ##__VA_ARGS__)
-    #define LOG_E(tag, format, ...) ESP_LOGE(tag, format, ##__VA_ARGS__)
-#else
-    #define LOG_I(tag, format, ...)
-    #define LOG_E(tag, format, ...)
-#endif
-
-typedef struct {
-    int16_t ir_ac_signal_current;
-    int16_t ir_ac_signal_previous;
-    int16_t ir_ac_signal_min;
-    int16_t ir_ac_signal_max;
-    int16_t ir_ac_max;
-    int16_t ir_ac_min;
-    int16_t ir_average_estimated;
-    int32_t ir_avg_reg;
-    int16_t positive_edge;
-    int16_t negative_edge;
-    uint32_t last_beat_time;
-    bool initialized;
-} hr_state_t;
-
-typedef struct {
-    int32_t spo2_value;
-    int8_t spo2_valid;
-    int32_t heart_rate;
-    int8_t hr_valid;
-    int32_t ratio_average;
-} spo2_result_t;
+#define OUTPUT_FORMAT_PACKET        0
+#define OUTPUT_FORMAT_APP           1
+#define OUTPUT_FORMAT               OUTPUT_FORMAT_APP
 
 typedef struct {
     uint32_t red;
     uint32_t ir;
-    int ecg;
+    uint64_t timestamp_us;
+} ppg_sample_t;
+
+typedef struct {
+    uint16_t ecg_value;
+    uint8_t lo_status;
+    uint64_t timestamp_us;
+} ecg_sample_t;
+
+typedef struct {
+    uint32_t ppg_red[PPG_SAMPLES_PER_PACKET];
+    uint32_t ppg_ir[PPG_SAMPLES_PER_PACKET];
+    uint16_t ecg_values[ECG_SAMPLES_PER_PACKET];
+    uint8_t lo_status[ECG_SAMPLES_PER_PACKET];
     float battery_voltage;
-    float battery_percent;
-    int lo_plus;
-    int lo_minus;
-    int32_t heart_rate;
-    int32_t spo2;
-    int8_t hr_valid;
-    int8_t spo2_valid;
-} sensor_data_t;
+    float battery_soc;
+    float temperature;
+    uint64_t packet_start_timestamp;
+    uint64_t packet_end_timestamp;
+    uint32_t packet_sequence;
+} unified_packet_t;
 
-static adc_oneshot_unit_handle_t adc1_handle;
-static sensor_data_t sensor_data = {0};
-static EventGroupHandle_t sync_event_group;
-static esp_timer_handle_t ppg_timer;
-static esp_timer_handle_t ecg_timer;
-static volatile uint32_t battery_counter = 0;
+static adc_oneshot_unit_handle_t adc1_handle = NULL;
+static esp_timer_handle_t ppg_timer = NULL;
+static esp_timer_handle_t ecg_timer = NULL;
+static esp_timer_handle_t packet_timer = NULL;
 
-static uint32_t red_buffer[ALGORITHM_BUFFER_SIZE];
-static uint32_t ir_buffer[ALGORITHM_BUFFER_SIZE];
-static int buffer_index = 0;
-static hr_state_t hr_state = {0};
+static QueueHandle_t ppg_queue = NULL;
+static QueueHandle_t ecg_queue = NULL;
+static QueueHandle_t packet_queue = NULL;
 
-static const uint8_t spo2_lookup_table[184] = {
-    95, 95, 95, 96, 96, 96, 97, 97, 97, 97, 97, 98, 98, 98, 98, 98, 
-    99, 99, 99, 99, 99, 99, 99, 99, 100, 100, 100, 100, 100, 100, 100, 100,
-    100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 99, 99, 99, 99,
-    99, 99, 99, 99, 98, 98, 98, 98, 98, 98, 97, 97, 97, 97, 96, 96,
-    96, 96, 95, 95, 95, 94, 94, 94, 93, 93, 93, 92, 92, 92, 91, 91,
-    90, 90, 89, 89, 89, 88, 88, 87, 87, 86, 86, 85, 85, 84, 84, 83,
-    82, 82, 81, 81, 80, 80, 79, 78, 78, 77, 76, 76, 75, 74, 74, 73,
-    72, 72, 71, 70, 69, 69, 68, 67, 66, 66, 65, 64, 63, 62, 62, 61,
-    60, 59, 58, 57, 56, 56, 55, 54, 53, 52, 51, 50, 49, 48, 47, 46,
-    45, 44, 43, 42, 41, 40, 39, 38, 37, 36, 35, 34, 33, 31, 30, 29,
-    28, 27, 26, 25, 23, 22, 21, 20, 19, 17, 16, 15, 14, 12, 11, 10,
-    9, 7, 6, 5, 3, 2, 1
-};
+static SemaphoreHandle_t system_data_mutex = NULL;
 
-static esp_err_t i2c_master_init_0(void) {
-    i2c_config_t conf = {
+static struct {
+    float battery_voltage;
+    float battery_soc;
+    float temperature;
+    bool temperature_valid;
+    uint32_t temp_read_counter;
+} system_data = {0};
+
+static esp_err_t i2c_master_init(void)
+{
+    const i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
-        .sda_io_num = I2C_MASTER_SDA_IO_0,
-        .scl_io_num = I2C_MASTER_SCL_IO_0,
+        .sda_io_num = I2C_MASTER_SDA_IO,
+        .scl_io_num = I2C_MASTER_SCL_IO,
         .sda_pullup_en = GPIO_PULLUP_ENABLE,
         .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_MASTER_FREQ_HZ_0,
+        .master.clk_speed = I2C_MASTER_FREQ_HZ,
     };
-    ESP_RETURN_ON_ERROR(i2c_param_config(I2C_MASTER_NUM_0, &conf), TAG, "I2C0 config failed");
-    return i2c_driver_install(I2C_MASTER_NUM_0, conf.mode, 0, 0, 0);
+    
+    ESP_RETURN_ON_ERROR(i2c_param_config(I2C_MASTER_NUM, &conf), TAG, "I2C param config failed");
+    return i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
 }
 
-static esp_err_t i2c_master_init_1(void) {
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = I2C_MASTER_SDA_IO_1,
-        .scl_io_num = I2C_MASTER_SCL_IO_1,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_MASTER_FREQ_HZ_1,
-    };
-    ESP_RETURN_ON_ERROR(i2c_param_config(I2C_MASTER_NUM_1, &conf), TAG, "I2C1 config failed");
-    return i2c_driver_install(I2C_MASTER_NUM_1, conf.mode, 0, 0, 0);
+static esp_err_t i2c_write_reg(uint8_t dev_addr, uint8_t reg_addr, uint8_t data)
+{
+    const uint8_t write_buf[2] = {reg_addr, data};
+    return i2c_master_write_to_device(I2C_MASTER_NUM, dev_addr, write_buf, 2, 
+                                     pdMS_TO_TICKS(I2C_MASTER_TIMEOUT_MS));
 }
 
-static esp_err_t max30101_write_reg(uint8_t reg, uint8_t data) {
-    uint8_t write_buf[2] = {reg, data};
-    return i2c_master_write_to_device(I2C_MASTER_NUM_0, MAX30101_I2C_ADDR, write_buf, 2, pdMS_TO_TICKS(100));
+static esp_err_t i2c_read_reg(uint8_t dev_addr, uint8_t reg_addr, uint8_t *data, size_t len)
+{
+    return i2c_master_write_read_device(I2C_MASTER_NUM, dev_addr, &reg_addr, 1, 
+                                       data, len, pdMS_TO_TICKS(I2C_MASTER_TIMEOUT_MS));
 }
 
-static esp_err_t max30101_read_reg(uint8_t reg, uint8_t *data) {
-    return i2c_master_write_read_device(I2C_MASTER_NUM_0, MAX30101_I2C_ADDR, &reg, 1, data, 1, pdMS_TO_TICKS(100));
-}
-
-static esp_err_t max30101_read_fifo(uint8_t *buffer, size_t len) {
-    uint8_t reg = MAX30101_REG_FIFO_DATA;
-    return i2c_master_write_read_device(I2C_MASTER_NUM_0, MAX30101_I2C_ADDR, &reg, 1, buffer, len, pdMS_TO_TICKS(100));
-}
-
-static esp_err_t max30101_get_fifo_status(uint8_t *available_samples) {
-    uint8_t wr_ptr, rd_ptr;
-    esp_err_t ret;
-    
-    ret = max30101_read_reg(MAX30101_REG_FIFO_WR_PTR, &wr_ptr);
-    if (ret != ESP_OK) return ret;
-    
-    ret = max30101_read_reg(MAX30101_REG_FIFO_RD_PTR, &rd_ptr);
-    if (ret != ESP_OK) return ret;
-    
-    *available_samples = (wr_ptr - rd_ptr) & 0x1F;
-    return ESP_OK;
-}
-
-static bool check_for_beat(int32_t ir_sample) {
-    bool beat_detected = false;
-    
-    int32_t ir_avg_reg = hr_state.ir_avg_reg;
-    
-    ir_avg_reg += ((((long) ir_sample << 15) - ir_avg_reg) >> 4);
-    hr_state.ir_avg_reg = ir_avg_reg;
-    hr_state.ir_average_estimated = (int16_t) (ir_avg_reg >> 15);
-    
-    int16_t ir_ac = (int16_t) ((long) ir_sample - (long) hr_state.ir_average_estimated);
-    hr_state.ir_ac_signal_previous = hr_state.ir_ac_signal_current;
-    hr_state.ir_ac_signal_current = ir_ac;
-    
-    hr_state.ir_ac_max = ir_ac;
-    hr_state.ir_ac_min = ir_ac;
-    
-    if (hr_state.ir_ac_signal_previous * hr_state.ir_ac_signal_current < 0) {
-        if (hr_state.ir_ac_signal_current > 0 && !hr_state.positive_edge) {
-            hr_state.positive_edge = 1;
-            hr_state.negative_edge = 0;
-            hr_state.ir_ac_max = hr_state.ir_ac_signal_current;
-        }
-        
-        if (hr_state.ir_ac_signal_current < 0 && hr_state.positive_edge) {
-            hr_state.positive_edge = 0;
-            hr_state.negative_edge = 1;
-            hr_state.ir_ac_min = hr_state.ir_ac_signal_current;
-            
-            int16_t threshold = (hr_state.ir_ac_max - hr_state.ir_ac_min) >> 2;
-            
-            if (hr_state.ir_ac_max > 20 && hr_state.ir_ac_min < -20 && 
-                (hr_state.ir_ac_max - hr_state.ir_ac_min) > 20 && 
-                hr_state.ir_ac_max > threshold && (-hr_state.ir_ac_min) > threshold) {
-                    
-                uint32_t current_time = esp_timer_get_time() / 1000;
-                if (current_time - hr_state.last_beat_time > 300) {
-                    beat_detected = true;
-                    hr_state.last_beat_time = current_time;
-                }
-            }
-        }
-    }
-    
-    return beat_detected;
-}
-
-static void calculate_spo2(uint32_t *ir_buf, uint32_t *red_buf, int32_t buf_len, spo2_result_t *result) {
-    result->spo2_valid = 0;
-    result->hr_valid = 0;
-    result->spo2_value = -999;
-    result->heart_rate = -999;
-    
-    if (buf_len < 100) return;
-    
-    uint32_t ir_mean = 0, red_mean = 0;
-    for (int i = 0; i < buf_len; i++) {
-        ir_mean += ir_buf[i];
-        red_mean += red_buf[i];
-    }
-    ir_mean /= buf_len;
-    red_mean /= buf_len;
-    
-    int32_t ir_ac_sum = 0, red_ac_sum = 0;
-    for (int i = 0; i < buf_len; i++) {
-        int32_t ir_ac = (int32_t)ir_buf[i] - (int32_t)ir_mean;
-        int32_t red_ac = (int32_t)red_buf[i] - (int32_t)red_mean;
-        
-        if (ir_ac < 0) ir_ac = -ir_ac;
-        if (red_ac < 0) red_ac = -red_ac;
-        
-        ir_ac_sum += ir_ac;
-        red_ac_sum += red_ac;
-    }
-    
-    if (ir_ac_sum == 0 || red_mean == 0 || ir_mean == 0) return;
-    
-    int32_t ratio_x100 = (red_ac_sum * ir_mean * 100) / (red_mean * ir_ac_sum);
-    
-    if (ratio_x100 >= 50 && ratio_x100 < 184) {
-        result->spo2_value = spo2_lookup_table[ratio_x100 - 50];
-        result->spo2_valid = 1;
-        result->ratio_average = ratio_x100;
-    }
-}
-
-static esp_err_t max30101_init(void) {
+static esp_err_t max30101_init(void)
+{
     uint8_t part_id;
-    ESP_RETURN_ON_ERROR(max30101_read_reg(MAX30101_REG_PART_ID, &part_id), TAG, "Part ID read failed");
-    LOG_I(TAG, "MAX30101 Part ID: 0x%02X", part_id);
+    ESP_RETURN_ON_ERROR(i2c_read_reg(MAX30101_I2C_ADDR, MAX30101_REG_PART_ID, &part_id, 1), 
+                        TAG, "Failed to read part ID");
+    
+    if (part_id != 0x15) {
+        ESP_LOGE(TAG, "Invalid part ID: 0x%02X", part_id);
+        return ESP_ERR_NOT_FOUND;
+    }
+    
+    ESP_LOGI(TAG, "MAX30101 Part ID: 0x%02X", part_id);
 
-    ESP_RETURN_ON_ERROR(max30101_write_reg(MAX30101_REG_MODE_CONFIG, 0x40), TAG, "Reset failed");
+    ESP_RETURN_ON_ERROR(i2c_write_reg(MAX30101_I2C_ADDR, MAX30101_REG_MODE_CONFIG, 0x40), 
+                        TAG, "Reset failed");
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    ESP_RETURN_ON_ERROR(max30101_write_reg(MAX30101_REG_FIFO_WR_PTR, 0x00), TAG, "WR PTR failed");
-    ESP_RETURN_ON_ERROR(max30101_write_reg(MAX30101_REG_FIFO_OVF_COUNTER, 0x00), TAG, "OVF failed");
-    ESP_RETURN_ON_ERROR(max30101_write_reg(MAX30101_REG_FIFO_RD_PTR, 0x00), TAG, "RD PTR failed");
-    ESP_RETURN_ON_ERROR(max30101_write_reg(MAX30101_REG_FIFO_CONFIG, 0x4F), TAG, "FIFO config failed");
-    ESP_RETURN_ON_ERROR(max30101_write_reg(MAX30101_REG_MODE_CONFIG, 0x03), TAG, "Mode config failed");
-    ESP_RETURN_ON_ERROR(max30101_write_reg(MAX30101_REG_SPO2_CONFIG, 0x24), TAG, "SpO2 config failed");
-    ESP_RETURN_ON_ERROR(max30101_write_reg(MAX30101_REG_LED1_PA, 0x24), TAG, "LED1 failed");
-    ESP_RETURN_ON_ERROR(max30101_write_reg(MAX30101_REG_LED2_PA, 0x24), TAG, "LED2 failed");
+    ESP_RETURN_ON_ERROR(i2c_write_reg(MAX30101_I2C_ADDR, MAX30101_REG_FIFO_WR_PTR, 0x00), 
+                        TAG, "FIFO WR PTR failed");
+    ESP_RETURN_ON_ERROR(i2c_write_reg(MAX30101_I2C_ADDR, MAX30101_REG_FIFO_RD_PTR, 0x00), 
+                        TAG, "FIFO RD PTR failed");
+    ESP_RETURN_ON_ERROR(i2c_write_reg(MAX30101_I2C_ADDR, MAX30101_REG_FIFO_CONFIG, 0x4F), 
+                        TAG, "FIFO config failed");
+    ESP_RETURN_ON_ERROR(i2c_write_reg(MAX30101_I2C_ADDR, MAX30101_REG_MODE_CONFIG, 0x03), 
+                        TAG, "Mode config failed");
+    ESP_RETURN_ON_ERROR(i2c_write_reg(MAX30101_I2C_ADDR, MAX30101_REG_SPO2_CONFIG, 0x03), 
+                        TAG, "SPO2 config failed");
+    ESP_RETURN_ON_ERROR(i2c_write_reg(MAX30101_I2C_ADDR, MAX30101_REG_LED1_PA, 0x24), 
+                        TAG, "LED1 PA failed");
+    ESP_RETURN_ON_ERROR(i2c_write_reg(MAX30101_I2C_ADDR, MAX30101_REG_LED2_PA, 0x24), 
+                        TAG, "LED2 PA failed");
 
     return ESP_OK;
 }
 
-static esp_err_t max17048_read_reg(uint8_t reg, uint16_t *data) {
-    uint8_t buffer[2];
-    esp_err_t ret = i2c_master_write_read_device(I2C_MASTER_NUM_1, MAX17048_I2C_ADDR, &reg, 1, buffer, 2, pdMS_TO_TICKS(100));
-    if (ret == ESP_OK) {
-        *data = (buffer[0] << 8) | buffer[1];
-    }
-    return ret;
+static esp_err_t max30101_read_fifo(uint32_t *red, uint32_t *ir)
+{
+    uint8_t fifo_data[6];
+    ESP_RETURN_ON_ERROR(i2c_read_reg(MAX30101_I2C_ADDR, MAX30101_REG_FIFO_DATA, fifo_data, 6), 
+                        TAG, "FIFO read failed");
+    
+    *red = ((uint32_t)fifo_data[0] << 16) | ((uint32_t)fifo_data[1] << 8) | fifo_data[2];
+    *red &= 0x3FFFF;
+    
+    *ir = ((uint32_t)fifo_data[3] << 16) | ((uint32_t)fifo_data[4] << 8) | fifo_data[5];
+    *ir &= 0x3FFFF;
+    
+    return ESP_OK;
 }
 
-static esp_err_t adc_init(void) {
-    adc_oneshot_unit_init_cfg_t init_config = {
+static esp_err_t max30101_read_temperature(float *temperature)
+{
+    ESP_RETURN_ON_ERROR(i2c_write_reg(MAX30101_I2C_ADDR, MAX30101_REG_TEMP_CONFIG, 0x01), 
+                        TAG, "Temp config failed");
+    
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    uint8_t temp_int, temp_frac;
+    ESP_RETURN_ON_ERROR(i2c_read_reg(MAX30101_I2C_ADDR, MAX30101_REG_TEMP_INT, &temp_int, 1), 
+                        TAG, "Temp int read failed");
+    ESP_RETURN_ON_ERROR(i2c_read_reg(MAX30101_I2C_ADDR, MAX30101_REG_TEMP_FRAC, &temp_frac, 1), 
+                        TAG, "Temp frac read failed");
+    
+    *temperature = (float)(int8_t)temp_int + ((float)temp_frac * 0.0625f);
+    
+    return ESP_OK;
+}
+
+static esp_err_t max17048_read_data(float *voltage, float *soc)
+{
+    uint8_t data[2];
+    
+    ESP_RETURN_ON_ERROR(i2c_read_reg(MAX17048_I2C_ADDR, MAX17048_REG_VCELL, data, 2), 
+                        TAG, "VCELL read failed");
+    uint16_t vcell = (data[0] << 8) | data[1];
+    *voltage = (float)(vcell >> 4) * 1.25f / 1000.0f;
+    
+    ESP_RETURN_ON_ERROR(i2c_read_reg(MAX17048_I2C_ADDR, MAX17048_REG_SOC, data, 2), 
+                        TAG, "SOC read failed");
+    uint16_t soc_reg = (data[0] << 8) | data[1];
+    *soc = (float)(soc_reg >> 8) + (float)(soc_reg & 0xFF) / 256.0f;
+    
+    return ESP_OK;
+}
+
+static esp_err_t adc_init(void)
+{
+    const adc_oneshot_unit_init_cfg_t init_config = {
         .unit_id = ADC_UNIT_1,
     };
-    ESP_RETURN_ON_ERROR(adc_oneshot_new_unit(&init_config, &adc1_handle), TAG, "ADC init failed");
+    ESP_RETURN_ON_ERROR(adc_oneshot_new_unit(&init_config, &adc1_handle), 
+                        TAG, "ADC unit init failed");
 
-    adc_oneshot_chan_cfg_t config = {
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    const adc_oneshot_chan_cfg_t config = {
+        .bitwidth = ECG_ADC_BITWIDTH,
         .atten = ECG_ADC_ATTEN,
     };
     return adc_oneshot_config_channel(adc1_handle, ECG_ADC_CHANNEL, &config);
 }
 
-static void gpio_init_all(void) {
-    gpio_config_t io_conf = {
+static void gpio_init_all(void)
+{
+    const gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << LO_PLUS_PIN) | (1ULL << LO_MINUS_PIN),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
@@ -325,181 +272,260 @@ static void gpio_init_all(void) {
     gpio_config(&io_conf);
 }
 
-static void IRAM_ATTR ppg_timer_callback(void* arg) {
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xEventGroupSetBitsFromISR(sync_event_group, PPG_READY_BIT, &xHigherPriorityTaskWoken);
-    if (xHigherPriorityTaskWoken) {
-        portYIELD_FROM_ISR();
-    }
-}
-
-static void IRAM_ATTR ecg_timer_callback(void* arg) {
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xEventGroupSetBitsFromISR(sync_event_group, ECG_READY_BIT, &xHigherPriorityTaskWoken);
-    if (xHigherPriorityTaskWoken) {
-        portYIELD_FROM_ISR();
-    }
-}
-
-static void ppg_task(void *pvParameters) {
-    uint8_t fifo_data[6];
-    uint8_t available_samples;
+static void IRAM_ATTR ppg_timer_callback(void* arg)
+{
+    BaseType_t higher_priority_task_woken = pdFALSE;
+    ppg_sample_t sample;
+    
     uint32_t red, ir;
-    static uint32_t sample_count = 0;
+    if (max30101_read_fifo(&red, &ir) == ESP_OK && red > 1000 && ir > 1000) {
+        sample.red = red;
+        sample.ir = ir;
+        sample.timestamp_us = esp_timer_get_time();
+        
+        xQueueSendFromISR(ppg_queue, &sample, &higher_priority_task_woken);
+    }
+    
+    if (higher_priority_task_woken) {
+        portYIELD_FROM_ISR();
+    }
+}
 
-    while (1) {
-        xEventGroupWaitBits(sync_event_group, PPG_READY_BIT, pdTRUE, pdFALSE, portMAX_DELAY);
-
-        if (max30101_get_fifo_status(&available_samples) == ESP_OK && available_samples > 0) {
-            for (uint8_t i = 0; i < available_samples; i++) {
-                if (max30101_read_fifo(fifo_data, 6) == ESP_OK) {
-                    red = ((uint32_t)fifo_data[0] << 16) | ((uint32_t)fifo_data[1] << 8) | fifo_data[2];
-                    red &= 0x3FFFF;
-
-                    ir = ((uint32_t)fifo_data[3] << 16) | ((uint32_t)fifo_data[4] << 8) | fifo_data[5];
-                    ir &= 0x3FFFF;
-
-                    if (red > 1000 && ir > 1000) {
-                        sensor_data.red = red;
-                        sensor_data.ir = ir;
-                        
-                        red_buffer[buffer_index] = red;
-                        ir_buffer[buffer_index] = ir;
-                        buffer_index = (buffer_index + 1) % ALGORITHM_BUFFER_SIZE;
-                        
-                        check_for_beat((int32_t)ir);
-                        
-                        sample_count++;
-                        if (sample_count % 64 == 0 && sample_count > 192) {
-                            spo2_result_t result;
-                            calculate_spo2(ir_buffer, red_buffer, ALGORITHM_BUFFER_SIZE, &result);
-                            
-                            if (result.spo2_valid) {
-                                sensor_data.spo2 = result.spo2_value;
-                                sensor_data.spo2_valid = 1;
-                            } else {
-                                sensor_data.spo2_valid = 0;
-                            }
+static void IRAM_ATTR ecg_timer_callback(void* arg)
+{
+    BaseType_t higher_priority_task_woken = pdFALSE;
+    ecg_sample_t sample;
+    
+    int adc_raw;
+    if (adc_oneshot_read(adc1_handle, ECG_ADC_CHANNEL, &adc_raw) == ESP_OK) {
+        sample.ecg_value = (uint16_t)adc_raw;
+        sample.lo_status = 0;
+        sample.lo_status |= gpio_get_level(LO_PLUS_PIN) ? 0x01 : 0x00;
+        sample.lo_status |= gpio_get_level(LO_MINUS_PIN) ? 0x02 : 0x00;
+        sample.timestamp_us = esp_timer_get_time();
+        
+        xQueueSendFromISR(ecg_queue, &sample, &higher_priority_task_woken);
+        
+        static uint32_t counter = 0;
+        counter++;
+        if (counter >= 125) {
+            counter = 0;
+            float voltage, soc, temperature;
+            
+            if (max17048_read_data(&voltage, &soc) == ESP_OK) {
+                if (xSemaphoreTakeFromISR(system_data_mutex, &higher_priority_task_woken) == pdTRUE) {
+                    system_data.battery_voltage = voltage;
+                    system_data.battery_soc = soc;
+                    
+                    system_data.temp_read_counter++;
+                    if (system_data.temp_read_counter >= 5) {
+                        system_data.temp_read_counter = 0;
+                        if (max30101_read_temperature(&temperature) == ESP_OK) {
+                            system_data.temperature = temperature;
+                            system_data.temperature_valid = true;
                         }
-                    } else {
-                        sensor_data.spo2_valid = 0;
                     }
+                    
+                    xSemaphoreGiveFromISR(system_data_mutex, &higher_priority_task_woken);
                 }
             }
         }
     }
+    
+    if (higher_priority_task_woken) {
+        portYIELD_FROM_ISR();
+    }
 }
 
-static void ecg_task(void *pvParameters) {
-    int adc_raw;
-    uint16_t vcell, soc;
-    static uint32_t ecg_sample_count = 0;
+static void IRAM_ATTR packet_timer_callback(void* arg)
+{
+    BaseType_t higher_priority_task_woken = pdFALSE;
+    const uint32_t signal = 1;
+    xQueueSendFromISR(packet_queue, &signal, &higher_priority_task_woken);
+    
+    if (higher_priority_task_woken) {
+        portYIELD_FROM_ISR();
+    }
+}
 
+static void print_packet_format(const unified_packet_t *packet)
+{
+    printf("PKT>seq:%lu,ppg_red:", (unsigned long)packet->packet_sequence);
+    for (int i = 0; i < PPG_SAMPLES_PER_PACKET; i++) {
+        printf("%lu", (unsigned long)packet->ppg_red[i]);
+        if (i < PPG_SAMPLES_PER_PACKET - 1) printf(",");
+    }
+    printf(",ppg_ir:");
+    for (int i = 0; i < PPG_SAMPLES_PER_PACKET; i++) {
+        printf("%lu", (unsigned long)packet->ppg_ir[i]);
+        if (i < PPG_SAMPLES_PER_PACKET - 1) printf(",");
+    }
+    printf(",ecg:");
+    for (int i = 0; i < ECG_SAMPLES_PER_PACKET; i++) {
+        printf("%u", packet->ecg_values[i]);
+        if (i < ECG_SAMPLES_PER_PACKET - 1) printf(",");
+    }
+    printf(",lo:");
+    for (int i = 0; i < ECG_SAMPLES_PER_PACKET; i++) {
+        printf("%u", packet->lo_status[i]);
+        if (i < ECG_SAMPLES_PER_PACKET - 1) printf(",");
+    }
+    printf(",batt_v:%.3f,batt_soc:%.1f,temp:%.2f,t_start:%llu,t_end:%llu\n",
+           packet->battery_voltage, packet->battery_soc, packet->temperature,
+           packet->packet_start_timestamp, packet->packet_end_timestamp);
+}
+
+static void print_app_format(const unified_packet_t *packet)
+{
+    printf(">A1:");
+    for (int i = 0; i < PPG_SAMPLES_PER_PACKET; i++) {
+        printf("%lu", (unsigned long)packet->ppg_red[i]);
+        if (i < PPG_SAMPLES_PER_PACKET - 1) printf(",");
+    }
+    
+    printf(",A2:");
+    for (int i = 0; i < PPG_SAMPLES_PER_PACKET; i++) {
+        printf("%lu", (unsigned long)packet->ppg_ir[i]);
+        if (i < PPG_SAMPLES_PER_PACKET - 1) printf(",");
+    }
+    
+    printf(",A3:");
+    for (int i = 0; i < ECG_SAMPLES_PER_PACKET; i++) {
+        printf("%u", packet->ecg_values[i]);
+        if (i < ECG_SAMPLES_PER_PACKET - 1) printf(",");
+    }
+    
+    printf(",A4:");
+    for (int i = 0; i < ECG_SAMPLES_PER_PACKET; i++) {
+        printf("%u", packet->lo_status[i]);
+        if (i < ECG_SAMPLES_PER_PACKET - 1) printf(",");
+    }
+    
+    printf(",A5:%.3f,A6:%.1f,A7:%.2f,A8:%lu,A9:%llu,A10:%llu\n",
+           packet->battery_voltage, 
+           packet->battery_soc, 
+           packet->temperature,
+           (unsigned long)packet->packet_sequence,
+           packet->packet_start_timestamp, 
+           packet->packet_end_timestamp);
+}
+
+static void packet_processing_task(void *pvParameters)
+{
+    unified_packet_t packet;
+    uint32_t packet_sequence = 0;
+    uint32_t signal;
+    
     while (1) {
-        xEventGroupWaitBits(sync_event_group, ECG_READY_BIT, pdTRUE, pdFALSE, portMAX_DELAY);
-
-        sensor_data.lo_plus = gpio_get_level(LO_PLUS_PIN);
-        sensor_data.lo_minus = gpio_get_level(LO_MINUS_PIN);
-        
-        if (adc_oneshot_read(adc1_handle, ECG_ADC_CHANNEL, &adc_raw) == ESP_OK) {
-            sensor_data.ecg = adc_raw;
-        }
-
-        ecg_sample_count++;
-        
-        battery_counter++;
-        if (battery_counter >= 256) {
-            battery_counter = 0;
-            if (max17048_read_reg(MAX17048_REG_VCELL, &vcell) == ESP_OK &&
-                max17048_read_reg(MAX17048_REG_SOC, &soc) == ESP_OK) {
-                sensor_data.battery_voltage = (vcell >> 4) * 1.25 / 1000.0;
-                sensor_data.battery_percent = (soc >> 8) + (soc & 0xFF) / 256.0;
+        if (xQueueReceive(packet_queue, &signal, portMAX_DELAY) == pdTRUE) {
+            packet.packet_sequence = packet_sequence++;
+            packet.packet_start_timestamp = esp_timer_get_time();
+            
+            for (int i = 0; i < PPG_SAMPLES_PER_PACKET; i++) {
+                ppg_sample_t ppg_sample;
+                if (xQueueReceive(ppg_queue, &ppg_sample, pdMS_TO_TICKS(5)) == pdTRUE) {
+                    packet.ppg_red[i] = ppg_sample.red;
+                    packet.ppg_ir[i] = ppg_sample.ir;
+                } else {
+                    packet.ppg_red[i] = (i > 0) ? packet.ppg_red[i-1] : 0;
+                    packet.ppg_ir[i] = (i > 0) ? packet.ppg_ir[i-1] : 0;
+                }
             }
-        }
-
-        if (ecg_sample_count % 2 == 0) {
-            if (sensor_data.spo2_valid) {
-                printf(">ecg:%d,ir:%lu,red:%lu,spo2:%ld,%.2f,%.1f,%d,%d\n",
-                    sensor_data.ecg,
-                    (unsigned long)sensor_data.ir,
-                    (unsigned long)sensor_data.red,
-                    sensor_data.spo2,
-                    sensor_data.battery_voltage,
-                    sensor_data.battery_percent,
-                    sensor_data.lo_minus,
-                    sensor_data.lo_plus);
+            
+            for (int i = 0; i < ECG_SAMPLES_PER_PACKET; i++) {
+                ecg_sample_t ecg_sample;
+                if (xQueueReceive(ecg_queue, &ecg_sample, pdMS_TO_TICKS(5)) == pdTRUE) {
+                    packet.ecg_values[i] = ecg_sample.ecg_value;
+                    packet.lo_status[i] = ecg_sample.lo_status;
+                } else {
+                    packet.ecg_values[i] = (i > 0) ? packet.ecg_values[i-1] : 0;
+                    packet.lo_status[i] = (i > 0) ? packet.lo_status[i-1] : 0;
+                }
+            }
+            
+            if (xSemaphoreTake(system_data_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                packet.battery_voltage = system_data.battery_voltage;
+                packet.battery_soc = system_data.battery_soc;
+                packet.temperature = system_data.temperature_valid ? system_data.temperature : -999.0f;
+                xSemaphoreGive(system_data_mutex);
             } else {
-                printf(">ecg:%d,ir:%lu,red:%lu,%.2f,%.1f,%d,%d\n",
-                    sensor_data.ecg,
-                    (unsigned long)sensor_data.ir,
-                    (unsigned long)sensor_data.red,
-                    sensor_data.battery_voltage,
-                    sensor_data.battery_percent,
-                    sensor_data.lo_minus,
-                    sensor_data.lo_plus);
+                packet.battery_voltage = 0.0f;
+                packet.battery_soc = 0.0f;
+                packet.temperature = -999.0f;
             }
+            
+            packet.packet_end_timestamp = esp_timer_get_time();
+            
+#if OUTPUT_FORMAT == OUTPUT_FORMAT_PACKET
+            print_packet_format(&packet);
+#elif OUTPUT_FORMAT == OUTPUT_FORMAT_APP
+            print_app_format(&packet);
+#endif
         }
     }
 }
 
-void app_main(void) {
-    LOG_I(TAG, "NirogScan Lite Starting...");
-    LOG_I(TAG, "PPG Sample Rate: %d Hz, ECG Sample Rate: %d Hz", PPG_SAMPLE_RATE_HZ, ECG_SAMPLE_RATE_HZ);
+void app_main(void)
+{
+    ESP_LOGI(TAG, "NirogScan Optimized Starting...");
+    ESP_LOGI(TAG, "PPG: %dHz, ECG: %dHz, Packet Rate: %.1fHz", 
+             PPG_SAMPLE_RATE_HZ, ECG_SAMPLE_RATE_HZ, 
+             1000000.0f / PACKET_TIMER_PERIOD_US);
 
-    sync_event_group = xEventGroupCreate();
-    if (sync_event_group == NULL) {
-        LOG_E(TAG, "Failed to create event group");
+    ppg_queue = xQueueCreate(QUEUE_SIZE, sizeof(ppg_sample_t));
+    ecg_queue = xQueueCreate(QUEUE_SIZE, sizeof(ecg_sample_t));
+    packet_queue = xQueueCreate(QUEUE_SIZE, sizeof(uint32_t));
+    system_data_mutex = xSemaphoreCreateMutex();
+
+    if (!ppg_queue || !ecg_queue || !packet_queue || !system_data_mutex) {
+        ESP_LOGE(TAG, "Failed to create queues or mutex");
         return;
     }
-
-    memset(&hr_state, 0, sizeof(hr_state_t));
 
     gpio_init_all();
-    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    ESP_ERROR_CHECK(i2c_master_init());
+    ESP_ERROR_CHECK(adc_init());
+    ESP_ERROR_CHECK(max30101_init());
 
-    if (i2c_master_init_0() != ESP_OK) {
-        LOG_E(TAG, "I2C0 init failed");
-        return;
-    }
+    ESP_LOGI(TAG, "Hardware initialized successfully");
 
-    if (i2c_master_init_1() != ESP_OK) {
-        LOG_E(TAG, "I2C1 init failed");
-        return;
-    }
+#if OUTPUT_FORMAT == OUTPUT_FORMAT_PACKET
+    printf("Type,Seq,PPG_Red[%d],PPG_IR[%d],ECG[%d],LO[%d],Battery_V,Battery_SOC,Temp,Time_Start,Time_End\n",
+           PPG_SAMPLES_PER_PACKET, PPG_SAMPLES_PER_PACKET, 
+           ECG_SAMPLES_PER_PACKET, ECG_SAMPLES_PER_PACKET);
+#elif OUTPUT_FORMAT == OUTPUT_FORMAT_APP
+    printf("# App Format: A1=PPG_Red[%d], A2=PPG_IR[%d], A3=ECG[%d], A4=LO_Status[%d], A5=Battery_V, A6=Battery_SOC, A7=Temp, A8=Seq, A9=Time_Start, A10=Time_End\n",
+           PPG_SAMPLES_PER_PACKET, PPG_SAMPLES_PER_PACKET, 
+           ECG_SAMPLES_PER_PACKET, ECG_SAMPLES_PER_PACKET);
+#endif
 
-    if (adc_init() != ESP_OK) {
-        LOG_E(TAG, "ADC init failed");
-        return;
-    }
-
-    if (max30101_init() != ESP_OK) {
-        LOG_E(TAG, "MAX30101 init failed");
-        return;
-    }
-
-    LOG_I(TAG, "All sensors initialized with dual sample rates");
-
-    printf("ecg,ir,red,spo2(optional),battery_v,battery_percent,lo_minus,lo_plus\n");
-
-    xTaskCreatePinnedToCore(ppg_task, "ppg_task", 8192, NULL, 10, NULL, 0);
-    xTaskCreatePinnedToCore(ecg_task, "ecg_task", 4096, NULL, 9, NULL, 1);
+    xTaskCreatePinnedToCore(packet_processing_task, "packet_proc", 8192, NULL, 5, NULL, 0);
 
     const esp_timer_create_args_t ppg_timer_args = {
         .callback = &ppg_timer_callback,
         .name = "ppg_timer"
     };
-
     const esp_timer_create_args_t ecg_timer_args = {
         .callback = &ecg_timer_callback,
         .name = "ecg_timer"
     };
+    const esp_timer_create_args_t packet_timer_args = {
+        .callback = &packet_timer_callback,
+        .name = "packet_timer"
+    };
 
     ESP_ERROR_CHECK(esp_timer_create(&ppg_timer_args, &ppg_timer));
     ESP_ERROR_CHECK(esp_timer_create(&ecg_timer_args, &ecg_timer));
-    
+    ESP_ERROR_CHECK(esp_timer_create(&packet_timer_args, &packet_timer));
+
     ESP_ERROR_CHECK(esp_timer_start_periodic(ppg_timer, PPG_TIMER_PERIOD_US));
     ESP_ERROR_CHECK(esp_timer_start_periodic(ecg_timer, ECG_TIMER_PERIOD_US));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(packet_timer, PACKET_TIMER_PERIOD_US));
 
-    LOG_I(TAG, "Started: PPG @ %d Hz, ECG @ %d Hz with HR/SpO2 algorithms", 
-          PPG_SAMPLE_RATE_HZ, ECG_SAMPLE_RATE_HZ);
+    ESP_LOGI(TAG, "All timers started - system operational");
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 }
