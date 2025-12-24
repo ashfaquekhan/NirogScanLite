@@ -1,0 +1,12 @@
+2025-12-24 23:12:34,287 - __main__ - INFO - CSV logging initialized: nirog_scan_data_20251224_231234.csv
+2025-12-24 23:12:34,288 - __main__ - INFO - Scanning for NirogScan devices...
+2025-12-24 23:12:34,955 - __main__ - ERROR - Device scanning error: Thread is configured for Windows GUI but callbacks are not working.
+2025-12-24 23:12:34,955 - __main__ - ERROR - Failed to connect to NirogScan device
+2025-12-24 23:12:51,174 - __main__ - INFO - CSV logging initialized: nirog_scan_data_20251224_231251.csv
+2025-12-24 23:12:51,175 - __main__ - INFO - Scanning for NirogScan devices...
+2025-12-24 23:12:51,788 - __main__ - ERROR - Device scanning error: Thread is configured for Windows GUI but callbacks are not working.
+2025-12-24 23:12:51,788 - __main__ - ERROR - Failed to connect to NirogScan device
+2025-12-24 23:13:19,781 - __main__ - INFO - CSV logging initialized: nirog_scan_data_20251224_231319.csv
+2025-12-24 23:13:19,785 - __main__ - INFO - Scanning for NirogScan devices...
+2025-12-24 23:13:20,462 - __main__ - ERROR - Device scanning error: Thread is configured for Windows GUI but callbacks are not working.
+2025-12-24 23:13:20,463 - __main__ - ERROR - Failed to connect to NirogScan device
