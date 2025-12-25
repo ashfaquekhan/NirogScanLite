@@ -276,8 +276,10 @@ static esp_err_t max30101_init(void) {
     ESP_RETURN_ON_ERROR(i2c_write_reg(I2C_MASTER_NUM_PPG, MAX30101_I2C_ADDR, MAX30101_REG_FIFO_RD_PTR, 0x00), TAG, "FIFO RD PTR failed");
     
     ESP_RETURN_ON_ERROR(i2c_write_reg(I2C_MASTER_NUM_PPG, MAX30101_I2C_ADDR, MAX30101_REG_FIFO_CONFIG, 0x4F), TAG, "FIFO config failed");
+    
     ESP_RETURN_ON_ERROR(i2c_write_reg(I2C_MASTER_NUM_PPG, MAX30101_I2C_ADDR, MAX30101_REG_MODE_CONFIG, 0x03), TAG, "Mode config failed");
-    ESP_RETURN_ON_ERROR(i2c_write_reg(I2C_MASTER_NUM_PPG, MAX30101_I2C_ADDR, MAX30101_REG_SPO2_CONFIG, 0x03), TAG, "SpO2 config failed");
+    
+    ESP_RETURN_ON_ERROR(i2c_write_reg(I2C_MASTER_NUM_PPG, MAX30101_I2C_ADDR, MAX30101_REG_SPO2_CONFIG, 0x27), TAG, "SpO2 config failed");
     
     ESP_RETURN_ON_ERROR(i2c_write_reg(I2C_MASTER_NUM_PPG, MAX30101_I2C_ADDR, MAX30101_REG_LED1_PA, 0x24), TAG, "LED1 config failed");
     ESP_RETURN_ON_ERROR(i2c_write_reg(I2C_MASTER_NUM_PPG, MAX30101_I2C_ADDR, MAX30101_REG_LED2_PA, 0x24), TAG, "LED2 config failed");
@@ -553,15 +555,24 @@ static void IRAM_ATTR ppg_timer_callback(void *arg) {
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     ppg_sample_t sample;
     
-    uint32_t red, ir;
-    if (max30101_read_fifo(&red, &ir) == ESP_OK) {
-        if (red > 1000 && ir > 1000) {
-            sample.red = red;
-            sample.ir = ir;
-            sample.timestamp_us = esp_timer_get_time();
-            
-            xQueueSendFromISR(ppg_queue, &sample, &xHigherPriorityTaskWoken);
-            ppg_sample_count++;
+    uint8_t wr_ptr, rd_ptr;
+    if (i2c_read_reg(I2C_MASTER_NUM_PPG, MAX30101_I2C_ADDR, MAX30101_REG_FIFO_WR_PTR, &wr_ptr) == ESP_OK &&
+        i2c_read_reg(I2C_MASTER_NUM_PPG, MAX30101_I2C_ADDR, MAX30101_REG_FIFO_RD_PTR, &rd_ptr) == ESP_OK) {
+        
+        uint8_t samples_available = (wr_ptr - rd_ptr) & 0x1F;
+        
+        if (samples_available > 0) {
+            uint32_t red, ir;
+            if (max30101_read_fifo(&red, &ir) == ESP_OK) {
+                if (red > 1000 && ir > 1000) {
+                    sample.red = red;
+                    sample.ir = ir;
+                    sample.timestamp_us = esp_timer_get_time();
+                    
+                    xQueueSendFromISR(ppg_queue, &sample, &xHigherPriorityTaskWoken);
+                    ppg_sample_count++;
+                }
+            }
         }
     }
     
