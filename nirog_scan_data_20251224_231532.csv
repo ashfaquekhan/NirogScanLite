@@ -1,1 +1,0 @@
-timestamp,sequence,ecg_quality,ppg_quality,battery_voltage,battery_percentage,temperature,system_status,packet_duration_ms,ecg_0,lo_status_0,ecg_1,lo_status_1,ecg_2,lo_status_2,ecg_3,lo_status_3,ecg_4,lo_status_4,ecg_5,lo_status_5,ecg_6,lo_status_6,ecg_7,lo_status_7,ecg_8,lo_status_8,ecg_9,lo_status_9,ppg_red_0,ppg_ir_0,ppg_red_1,ppg_ir_1,ppg_red_2,ppg_ir_2,ppg_red_3,ppg_ir_3

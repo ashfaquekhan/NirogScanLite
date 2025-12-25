@@ -1,21 +1,3 @@
-/**
- * @file nirog_scan_fixed.c
- * @brief Advanced Health Monitoring System for ESP32-S3 (Compilation Fixed)
- * 
- * Industrial-grade implementation featuring:
- * - ECG sampling at 125Hz via AD8232
- * - PPG sampling at 50Hz via MAX30101/102 
- * - Synchronized data collection (4 PPG + 5 ECG samples per 80ms packet)
- * - BLE GATT server for real-time data transmission
- * - Fuel gauge monitoring (MAX17048)
- * - Temperature sensing via MAX30101 internal sensor
- * - Leads-off detection for ECG quality monitoring
- * 
- * @author Embedded Systems Engineer
- * @version 1.0.1 (Fixed compilation issues)
- * @date 2025
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,7 +25,6 @@
 #include "esp_bt_main.h"
 #include "esp_gatt_common_api.h"
 
-/* Compatibility macros for ESP_RETURN_ON_ERROR */
 #ifndef unlikely
 #define unlikely(x) __builtin_expect(!!(x), 0)
 #endif
@@ -58,27 +39,20 @@
 } while(0)
 #endif
 
-/*============================================================================
- * SYSTEM CONFIGURATION
- *============================================================================*/
-
 #define TAG                           "NirogScan"
-#define SYSTEM_VERSION                "1.0.1"
+#define SYSTEM_VERSION                "1.0.2"
 
-/* Sampling Configuration */
 #define ECG_SAMPLE_RATE_HZ            125U
 #define PPG_SAMPLE_RATE_HZ            50U
-#define PACKET_RATE_HZ                12U  /* 80ms packets */
+#define PACKET_RATE_HZ                12U
 
-#define ECG_TIMER_PERIOD_US           (1000000U / ECG_SAMPLE_RATE_HZ)  /* 8000us */
-#define PPG_TIMER_PERIOD_US           (1000000U / PPG_SAMPLE_RATE_HZ)  /* 20000us */
-#define PACKET_TIMER_PERIOD_US        (1000000U / PACKET_RATE_HZ)      /* 83333us */
+#define ECG_TIMER_PERIOD_US           (1000000U / ECG_SAMPLE_RATE_HZ)
+#define PPG_TIMER_PERIOD_US           (1000000U / PPG_SAMPLE_RATE_HZ)
+#define PACKET_TIMER_PERIOD_US        (1000000U / PACKET_RATE_HZ)
 
-/* Packet Structure: 80ms window */
-#define ECG_SAMPLES_PER_PACKET        10U  /* 125Hz * 0.08s = 10 */
-#define PPG_SAMPLES_PER_PACKET        4U   /* 50Hz * 0.08s = 4 */
+#define ECG_SAMPLES_PER_PACKET        10U
+#define PPG_SAMPLES_PER_PACKET        4U
 
-/* Hardware Pins */
 #define I2C_MASTER_SCL_IO_PPG         9
 #define I2C_MASTER_SDA_IO_PPG         8
 #define I2C_MASTER_NUM_PPG            I2C_NUM_0
@@ -98,11 +72,9 @@
 #define LO_PLUS_PIN                   GPIO_NUM_16
 #define LO_MINUS_PIN                  GPIO_NUM_17
 
-/* Device Addresses */
 #define MAX30101_I2C_ADDR             0x57
 #define MAX17048_I2C_ADDR             0x36
 
-/* MAX30101 Registers */
 #define MAX30101_REG_INT_STATUS_1     0x00
 #define MAX30101_REG_INT_STATUS_2     0x01
 #define MAX30101_REG_INT_ENABLE_1     0x02
@@ -121,31 +93,26 @@
 #define MAX30101_REG_DIETEMPCONFIG    0x21
 #define MAX30101_REG_PART_ID          0xFF
 
-/* MAX17048 Registers */
 #define MAX17048_REG_VCELL            0x02
 #define MAX17048_REG_SOC              0x04
 
-/* BLE Configuration */
 #define DEVICE_NAME                   "NirogScan"
-#define HEALTH_SERVICE_UUID           0x180D  /* Heart Rate Service */
-#define DATA_CHARACTERISTIC_UUID      0x2A37  /* Heart Rate Measurement */
-#define BATTERY_SERVICE_UUID          0x180F  /* Battery Service */
-#define BATTERY_LEVEL_UUID            0x2A19  /* Battery Level */
+#define HEALTH_SERVICE_UUID           0x180D
+#define DATA_CHARACTERISTIC_UUID      0x2A37
+#define BATTERY_SERVICE_UUID          0x180F
+#define BATTERY_LEVEL_UUID            0x2A19
 
-/* Queue and Buffer Sizes */
 #define ECG_QUEUE_SIZE                32U
 #define PPG_QUEUE_SIZE                16U
 #define PACKET_QUEUE_SIZE             8U
 #define BLE_DATA_QUEUE_SIZE           4U
 
-/* System Limits */
 #define MAX_BLE_PACKET_SIZE           512U
 #define TEMP_READ_INTERVAL_MS         5000U
 #define BATTERY_READ_INTERVAL_MS      10000U
 
-/*============================================================================
- * TYPE DEFINITIONS  
- *============================================================================*/
+#define GATTS_APP_ID                  0
+#define GATTS_NUM_HANDLE              4
 
 typedef enum {
     SYSTEM_STATE_INIT = 0,
@@ -156,7 +123,7 @@ typedef enum {
 
 typedef struct {
     int16_t value;
-    uint8_t leads_off_status;  /* bit0: LO+, bit1: LO- */
+    uint8_t leads_off_status;
     uint32_t timestamp_us;
 } ecg_sample_t;
 
@@ -177,99 +144,64 @@ typedef struct {
     uint32_t timestamp_us;
 } temperature_data_t;
 
-/**
- * @brief Unified health data packet (80ms window)
- * 
- * Contains synchronized samples from all sensors:
- * - 10 ECG samples (125Hz * 0.08s)
- * - 4 PPG samples (50Hz * 0.08s)
- * - System data (battery, temperature, leads-off)
- */
-typedef struct {
-    /* Header */
+typedef struct __attribute__((packed)) {
     uint16_t sequence_number;
     uint32_t timestamp_start_us;
     uint32_t timestamp_end_us;
     
-    /* ECG Data (10 samples) */
     int16_t ecg_values[ECG_SAMPLES_PER_PACKET];
     uint8_t leads_off_status[ECG_SAMPLES_PER_PACKET];
     
-    /* PPG Data (4 samples) */
     uint32_t ppg_red[PPG_SAMPLES_PER_PACKET];
     uint32_t ppg_ir[PPG_SAMPLES_PER_PACKET];
     
-    /* System Data */
     float battery_voltage;
     float battery_percentage;
     float temperature;
     
-    /* Status Flags */
-    uint8_t ecg_quality;     /* 0-100% */
-    uint8_t ppg_quality;     /* 0-100% */
-    uint8_t system_status;   /* bit flags for errors */
+    uint8_t ecg_quality;
+    uint8_t ppg_quality;
+    uint8_t system_status;
     
-    /* Footer for integrity */
     uint16_t checksum;
 } health_data_packet_t;
 
 typedef struct {
-    esp_gatts_cb_t gatts_cb;
     uint16_t gatts_if;
-    uint16_t app_id;
     uint16_t conn_id;
     uint16_t service_handle;
     uint16_t char_handle;
     uint16_t descr_handle;
-    esp_bt_uuid_t service_uuid;
-    esp_bt_uuid_t char_uuid;
+    bool notify_enabled;
 } ble_profile_t;
 
-/*============================================================================
- * GLOBAL VARIABLES
- *============================================================================*/
-
-/* Hardware Handles */
 static adc_oneshot_unit_handle_t adc1_handle = NULL;
 static esp_timer_handle_t ecg_timer = NULL;
 static esp_timer_handle_t ppg_timer = NULL;
 static esp_timer_handle_t packet_timer = NULL;
 
-/* FreeRTOS Objects */
 static QueueHandle_t ecg_queue = NULL;
 static QueueHandle_t ppg_queue = NULL;
 static QueueHandle_t packet_queue = NULL;
 static QueueHandle_t ble_data_queue = NULL;
 static SemaphoreHandle_t sensor_data_mutex = NULL;
 
-/* System State */
 static volatile system_state_t system_state = SYSTEM_STATE_INIT;
 static volatile uint16_t packet_sequence = 0;
 
-/* Sensor Data Buffers */
 static ecg_sample_t ecg_buffer[ECG_SAMPLES_PER_PACKET];
 static ppg_sample_t ppg_buffer[PPG_SAMPLES_PER_PACKET];
 static battery_data_t battery_data = {0};
 static temperature_data_t temp_data = {0};
 
-/* BLE Profile */
 static ble_profile_t health_profile = {0};
 static bool ble_connected = false;
-static uint16_t ble_conn_id = 0;
 
-/* Statistics */
 static uint32_t ecg_sample_count = 0;
 static uint32_t ppg_sample_count = 0;
 static uint32_t packet_count = 0;
 static uint32_t ble_tx_count = 0;
 
-/*============================================================================
- * UTILITY FUNCTIONS
- *============================================================================*/
-
-/**
- * @brief Calculate simple checksum for data integrity
- */
 static uint16_t calculate_checksum(const uint8_t *data, size_t length) {
     uint16_t checksum = 0;
     for (size_t i = 0; i < length; i++) {
@@ -278,9 +210,6 @@ static uint16_t calculate_checksum(const uint8_t *data, size_t length) {
     return checksum;
 }
 
-/**
- * @brief Validate ECG signal quality based on leads-off detection
- */
 static uint8_t calculate_ecg_quality(const uint8_t *leads_off_status, size_t count) {
     uint32_t good_samples = 0;
     for (size_t i = 0; i < count; i++) {
@@ -291,9 +220,6 @@ static uint8_t calculate_ecg_quality(const uint8_t *leads_off_status, size_t cou
     return (uint8_t)((good_samples * 100) / count);
 }
 
-/**
- * @brief Validate PPG signal quality based on signal amplitude
- */
 static uint8_t calculate_ppg_quality(const uint32_t *ir_values, size_t count) {
     uint32_t valid_samples = 0;
     for (size_t i = 0; i < count; i++) {
@@ -304,13 +230,6 @@ static uint8_t calculate_ppg_quality(const uint32_t *ir_values, size_t count) {
     return (uint8_t)((valid_samples * 100) / count);
 }
 
-/*============================================================================
- * HARDWARE ABSTRACTION LAYER
- *============================================================================*/
-
-/**
- * @brief Initialize I2C master interface
- */
 static esp_err_t i2c_master_init(i2c_port_t port, int sda_pin, int scl_pin) {
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
@@ -325,35 +244,19 @@ static esp_err_t i2c_master_init(i2c_port_t port, int sda_pin, int scl_pin) {
     return i2c_driver_install(port, conf.mode, 0, 0, 0);
 }
 
-/**
- * @brief Write single register to I2C device
- */
 static esp_err_t i2c_write_reg(i2c_port_t port, uint8_t device_addr, uint8_t reg, uint8_t data) {
     uint8_t write_buf[2] = {reg, data};
     return i2c_master_write_to_device(port, device_addr, write_buf, sizeof(write_buf), pdMS_TO_TICKS(I2C_TIMEOUT_MS));
 }
 
-/**
- * @brief Read single register from I2C device
- */
 static esp_err_t i2c_read_reg(i2c_port_t port, uint8_t device_addr, uint8_t reg, uint8_t *data) {
     return i2c_master_write_read_device(port, device_addr, &reg, 1, data, 1, pdMS_TO_TICKS(I2C_TIMEOUT_MS));
 }
 
-/**
- * @brief Read multiple registers from I2C device
- */
 static esp_err_t i2c_read_regs(i2c_port_t port, uint8_t device_addr, uint8_t reg, uint8_t *data, size_t length) {
     return i2c_master_write_read_device(port, device_addr, &reg, 1, data, length, pdMS_TO_TICKS(I2C_TIMEOUT_MS));
 }
 
-/*============================================================================
- * MAX30101 DRIVER FUNCTIONS
- *============================================================================*/
-
-/**
- * @brief Initialize MAX30101 pulse oximeter sensor
- */
 static esp_err_t max30101_init(void) {
     uint8_t part_id;
     ESP_RETURN_ON_ERROR(i2c_read_reg(I2C_MASTER_NUM_PPG, MAX30101_I2C_ADDR, MAX30101_REG_PART_ID, &part_id), TAG, "Failed to read part ID");
@@ -382,9 +285,6 @@ static esp_err_t max30101_init(void) {
     return ESP_OK;
 }
 
-/**
- * @brief Read FIFO data from MAX30101
- */
 static esp_err_t max30101_read_fifo(uint32_t *red, uint32_t *ir) {
     uint8_t wr_ptr, rd_ptr;
     
@@ -408,13 +308,9 @@ static esp_err_t max30101_read_fifo(uint32_t *red, uint32_t *ir) {
     return ESP_OK;
 }
 
-/**
- * @brief Read temperature from MAX30101 internal sensor
- */
 static esp_err_t max30101_read_temperature(float *temperature) {
     ESP_RETURN_ON_ERROR(i2c_write_reg(I2C_MASTER_NUM_PPG, MAX30101_I2C_ADDR, MAX30101_REG_DIETEMPCONFIG, 0x01), TAG, "Temp config failed");
     
-    /* Wait for temperature conversion */
     uint8_t status;
     for (int i = 0; i < 100; i++) {
         vTaskDelay(pdMS_TO_TICKS(1));
@@ -430,13 +326,6 @@ static esp_err_t max30101_read_temperature(float *temperature) {
     return ESP_OK;
 }
 
-/*============================================================================
- * MAX17048 FUEL GAUGE FUNCTIONS
- *============================================================================*/
-
-/**
- * @brief Read battery data from MAX17048 fuel gauge
- */
 static esp_err_t max17048_read_battery(float *voltage, float *percentage) {
     uint8_t buffer[2];
     
@@ -451,13 +340,6 @@ static esp_err_t max17048_read_battery(float *voltage, float *percentage) {
     return ESP_OK;
 }
 
-/*============================================================================
- * ADC FUNCTIONS FOR ECG
- *============================================================================*/
-
-/**
- * @brief Initialize ADC for ECG signal acquisition
- */
 static esp_err_t adc_init(void) {
     adc_oneshot_unit_init_cfg_t init_config = {
         .unit_id = ADC_UNIT_1,
@@ -471,13 +353,6 @@ static esp_err_t adc_init(void) {
     return adc_oneshot_config_channel(adc1_handle, ECG_ADC_CHANNEL, &config);
 }
 
-/*============================================================================
- * GPIO FUNCTIONS
- *============================================================================*/
-
-/**
- * @brief Initialize GPIO for leads-off detection
- */
 static esp_err_t gpio_init_leads_off(void) {
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << LO_PLUS_PIN) | (1ULL << LO_MINUS_PIN),
@@ -489,13 +364,6 @@ static esp_err_t gpio_init_leads_off(void) {
     return gpio_config(&io_conf);
 }
 
-/*============================================================================
- * BLE IMPLEMENTATION
- *============================================================================*/
-
-/**
- * @brief BLE GAP event handler
- */
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
     switch (event) {
         case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
@@ -513,9 +381,6 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
     }
 }
 
-/**
- * @brief BLE GATT server event handler  
- */
 static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param) {
     switch (event) {
         case ESP_GATTS_REG_EVT:
@@ -544,7 +409,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
                     .id.inst_id = 0x00,
                     .id.uuid.len = ESP_UUID_LEN_16,
                     .id.uuid.uuid.uuid16 = HEALTH_SERVICE_UUID,
-                }, 4);
+                }, GATTS_NUM_HANDLE);
             }
             break;
             
@@ -553,29 +418,58 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
                 health_profile.service_handle = param->create.service_handle;
                 esp_ble_gatts_start_service(health_profile.service_handle);
                 
-                esp_ble_gatts_add_char(health_profile.service_handle, &(esp_bt_uuid_t){
+                esp_bt_uuid_t char_uuid = {
                     .len = ESP_UUID_LEN_16,
                     .uuid.uuid16 = DATA_CHARACTERISTIC_UUID,
-                }, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
-                ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY,
-                NULL, NULL);
+                };
+                
+                esp_ble_gatts_add_char(health_profile.service_handle, &char_uuid,
+                    ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+                    ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY,
+                    NULL, NULL);
             }
             break;
             
         case ESP_GATTS_ADD_CHAR_EVT:
             if (param->add_char.status == ESP_GATT_OK) {
                 health_profile.char_handle = param->add_char.attr_handle;
+                ESP_LOGI(TAG, "Characteristic handle: %d", health_profile.char_handle);
+                
+                esp_bt_uuid_t descr_uuid = {
+                    .len = ESP_UUID_LEN_16,
+                    .uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG,
+                };
+                
+                esp_ble_gatts_add_char_descr(health_profile.service_handle, &descr_uuid,
+                    ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+                    NULL, NULL);
+            }
+            break;
+            
+        case ESP_GATTS_ADD_CHAR_DESCR_EVT:
+            if (param->add_char_descr.status == ESP_GATT_OK) {
+                health_profile.descr_handle = param->add_char_descr.attr_handle;
+                ESP_LOGI(TAG, "Descriptor handle: %d", health_profile.descr_handle);
             }
             break;
             
         case ESP_GATTS_CONNECT_EVT:
             ble_connected = true;
-            ble_conn_id = param->connect.conn_id;
-            ESP_LOGI(TAG, "BLE client connected");
+            health_profile.conn_id = param->connect.conn_id;
+            ESP_LOGI(TAG, "BLE client connected, conn_id=%d", param->connect.conn_id);
+            
+            esp_ble_conn_update_params_t conn_params = {0};
+            memcpy(conn_params.bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
+            conn_params.latency = 0;
+            conn_params.max_int = 0x20;
+            conn_params.min_int = 0x10;
+            conn_params.timeout = 400;
+            esp_ble_gap_update_conn_params(&conn_params);
             break;
             
         case ESP_GATTS_DISCONNECT_EVT:
             ble_connected = false;
+            health_profile.notify_enabled = false;
             esp_ble_gap_start_advertising(&(esp_ble_adv_params_t){
                 .adv_int_min = 0x20,
                 .adv_int_max = 0x40,
@@ -587,14 +481,37 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
             ESP_LOGI(TAG, "BLE client disconnected");
             break;
             
+        case ESP_GATTS_WRITE_EVT:
+            ESP_LOGI(TAG, "WRITE event: handle=%d, len=%d", param->write.handle, param->write.len);
+            
+            if (param->write.handle == health_profile.descr_handle && param->write.len == 2) {
+                uint16_t descr_value = param->write.value[1]<<8 | param->write.value[0];
+                ESP_LOGI(TAG, "CCCD write: 0x%04x", descr_value);
+                
+                if (descr_value == 0x0001) {
+                    health_profile.notify_enabled = true;
+                    ESP_LOGI(TAG, "Notifications ENABLED");
+                } else if (descr_value == 0x0000) {
+                    health_profile.notify_enabled = false;
+                    ESP_LOGI(TAG, "Notifications DISABLED");
+                }
+            }
+            
+            if (param->write.need_rsp) {
+                esp_ble_gatts_send_response(gatts_if, param->write.conn_id, 
+                    param->write.trans_id, ESP_GATT_OK, NULL);
+            }
+            break;
+            
+        case ESP_GATTS_MTU_EVT:
+            ESP_LOGI(TAG, "MTU exchange, MTU=%d", param->mtu.mtu);
+            break;
+            
         default:
             break;
     }
 }
 
-/**
- * @brief Initialize BLE stack and GATT server
- */
 static esp_err_t ble_init(void) {
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     ESP_RETURN_ON_ERROR(esp_bt_controller_init(&bt_cfg), TAG, "BT controller init failed");
@@ -604,19 +521,12 @@ static esp_err_t ble_init(void) {
     
     ESP_RETURN_ON_ERROR(esp_ble_gatts_register_callback(gatts_event_handler), TAG, "GATTS callback register failed");
     ESP_RETURN_ON_ERROR(esp_ble_gap_register_callback(gap_event_handler), TAG, "GAP callback register failed");
-    ESP_RETURN_ON_ERROR(esp_ble_gatts_app_register(0), TAG, "GATTS app register failed");
+    ESP_RETURN_ON_ERROR(esp_ble_gatts_app_register(GATTS_APP_ID), TAG, "GATTS app register failed");
     ESP_RETURN_ON_ERROR(esp_ble_gatt_set_local_mtu(512), TAG, "Set local MTU failed");
     
     return ESP_OK;
 }
 
-/*============================================================================
- * INTERRUPT SERVICE ROUTINES
- *============================================================================*/
-
-/**
- * @brief ECG timer callback - 125Hz sampling
- */
 static void IRAM_ATTR ecg_timer_callback(void *arg) {
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     ecg_sample_t sample;
@@ -639,9 +549,6 @@ static void IRAM_ATTR ecg_timer_callback(void *arg) {
     }
 }
 
-/**
- * @brief PPG timer callback - 50Hz sampling
- */
 static void IRAM_ATTR ppg_timer_callback(void *arg) {
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     ppg_sample_t sample;
@@ -663,9 +570,6 @@ static void IRAM_ATTR ppg_timer_callback(void *arg) {
     }
 }
 
-/**
- * @brief Packet timer callback - 12Hz packet generation
- */
 static void IRAM_ATTR packet_timer_callback(void *arg) {
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     uint32_t trigger = 1;
@@ -677,13 +581,6 @@ static void IRAM_ATTR packet_timer_callback(void *arg) {
     }
 }
 
-/*============================================================================
- * TASK IMPLEMENTATIONS
- *============================================================================*/
-
-/**
- * @brief System monitoring task
- */
 static void system_monitor_task(void *pvParameters) {
     TickType_t last_temp_read = 0;
     TickType_t last_battery_read = 0;
@@ -722,9 +619,6 @@ static void system_monitor_task(void *pvParameters) {
     vTaskDelete(NULL);
 }
 
-/**
- * @brief Data packet assembly and transmission task
- */
 static void packet_assembly_task(void *pvParameters) {
     health_data_packet_t packet;
     uint32_t trigger;
@@ -736,7 +630,6 @@ static void packet_assembly_task(void *pvParameters) {
             packet.sequence_number = packet_sequence++;
             packet.timestamp_start_us = esp_timer_get_time();
             
-            /* Collect ECG samples */
             for (int i = 0; i < ECG_SAMPLES_PER_PACKET; i++) {
                 if (xQueueReceive(ecg_queue, &ecg_buffer[i], pdMS_TO_TICKS(10)) == pdTRUE) {
                     packet.ecg_values[i] = ecg_buffer[i].value;
@@ -747,7 +640,6 @@ static void packet_assembly_task(void *pvParameters) {
                 }
             }
             
-            /* Collect PPG samples */
             for (int i = 0; i < PPG_SAMPLES_PER_PACKET; i++) {
                 if (xQueueReceive(ppg_queue, &ppg_buffer[i], pdMS_TO_TICKS(10)) == pdTRUE) {
                     packet.ppg_red[i] = ppg_buffer[i].red;
@@ -758,7 +650,6 @@ static void packet_assembly_task(void *pvParameters) {
                 }
             }
             
-            /* Get system data */
             if (xSemaphoreTake(sensor_data_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 packet.battery_voltage = battery_data.voltage;
                 packet.battery_percentage = battery_data.percentage;
@@ -768,29 +659,23 @@ static void packet_assembly_task(void *pvParameters) {
             
             packet.timestamp_end_us = esp_timer_get_time();
             
-            /* Calculate quality metrics */
             packet.ecg_quality = calculate_ecg_quality(packet.leads_off_status, ECG_SAMPLES_PER_PACKET);
             
-            /* Copy PPG IR data to avoid packed member address issue */
             uint32_t ppg_ir_temp[PPG_SAMPLES_PER_PACKET];
             memcpy(ppg_ir_temp, packet.ppg_ir, sizeof(ppg_ir_temp));
             packet.ppg_quality = calculate_ppg_quality(ppg_ir_temp, PPG_SAMPLES_PER_PACKET);
             
             packet.system_status = (system_state == SYSTEM_STATE_RUNNING) ? 0x00 : 0x01;
             
-            /* Calculate checksum */
             packet.checksum = calculate_checksum((uint8_t*)&packet, sizeof(packet) - sizeof(packet.checksum));
             
-            /* Send to BLE queue */
-            if (ble_connected) {
+            if (ble_connected && health_profile.notify_enabled) {
                 xQueueSend(ble_data_queue, &packet, 0);
             }
             
-            /* Output to UART for debugging */
-            printf("PKT>seq:%u,ecg_qual:%u,ppg_qual:%u,batt:%.2f,temp:%.2f,ts:%lu\n",
+            printf("PKT>seq:%u,ecg_qual:%u,ppg_qual:%u,batt:%.2f,temp:%.2f\n",
                    packet.sequence_number, packet.ecg_quality, packet.ppg_quality,
-                   packet.battery_voltage, packet.temperature, 
-                   (unsigned long)packet.timestamp_end_us);
+                   packet.battery_voltage, packet.temperature);
             
             packet_count++;
         }
@@ -799,18 +684,19 @@ static void packet_assembly_task(void *pvParameters) {
     vTaskDelete(NULL);
 }
 
-/**
- * @brief BLE data transmission task
- */
 static void ble_transmission_task(void *pvParameters) {
     health_data_packet_t packet;
     
     while (system_state == SYSTEM_STATE_RUNNING) {
         if (xQueueReceive(ble_data_queue, &packet, portMAX_DELAY) == pdTRUE) {
-            if (ble_connected && health_profile.char_handle != 0) {
+            if (ble_connected && health_profile.notify_enabled && health_profile.char_handle != 0) {
                 esp_err_t ret = esp_ble_gatts_send_indicate(
-                    health_profile.gatts_if, ble_conn_id, health_profile.char_handle,
-                    sizeof(packet), (uint8_t*)&packet, false);
+                    health_profile.gatts_if, 
+                    health_profile.conn_id, 
+                    health_profile.char_handle,
+                    sizeof(packet), 
+                    (uint8_t*)&packet, 
+                    false);
                 
                 if (ret == ESP_OK) {
                     ble_tx_count++;
@@ -824,13 +710,6 @@ static void ble_transmission_task(void *pvParameters) {
     vTaskDelete(NULL);
 }
 
-/*============================================================================
- * SYSTEM INITIALIZATION
- *============================================================================*/
-
-/**
- * @brief Initialize all hardware peripherals
- */
 static esp_err_t hardware_init(void) {
     ESP_RETURN_ON_ERROR(gpio_init_leads_off(), TAG, "GPIO init failed");
     ESP_RETURN_ON_ERROR(adc_init(), TAG, "ADC init failed");
@@ -841,9 +720,6 @@ static esp_err_t hardware_init(void) {
     return ESP_OK;
 }
 
-/**
- * @brief Initialize FreeRTOS objects
- */
 static esp_err_t rtos_init(void) {
     ecg_queue = xQueueCreate(ECG_QUEUE_SIZE, sizeof(ecg_sample_t));
     ppg_queue = xQueueCreate(PPG_QUEUE_SIZE, sizeof(ppg_sample_t));
@@ -859,9 +735,6 @@ static esp_err_t rtos_init(void) {
     return ESP_OK;
 }
 
-/**
- * @brief Start all timer interrupts
- */
 static esp_err_t timers_start(void) {
     const esp_timer_create_args_t ecg_timer_args = {
         .callback = &ecg_timer_callback,
@@ -888,10 +761,6 @@ static esp_err_t timers_start(void) {
     
     return ESP_OK;
 }
-
-/*============================================================================
- * MAIN APPLICATION
- *============================================================================*/
 
 void app_main(void) {
     ESP_LOGI(TAG, "NirogScan Health Monitor v%s Starting", SYSTEM_VERSION);
@@ -932,7 +801,6 @@ void app_main(void) {
     
     ESP_LOGI(TAG, "System initialized successfully");
     
-    /* Main monitoring loop */
     TickType_t last_stats = xTaskGetTickCount();
     
     while (system_state == SYSTEM_STATE_RUNNING) {

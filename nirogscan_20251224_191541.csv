@@ -1,1 +1,0 @@
-timestamp,sequence,magic,ppg_red_1,ppg_red_2,ppg_ir_1,ppg_ir_2,ecg_1,ecg_2,ecg_3,ecg_4,ecg_5,lo_status_1,lo_status_2,lo_status_3,lo_status_4,lo_status_5,battery_voltage_v,battery_soc,temperature_c,sensor_status,core_status,packet_start_timestamp,packet_end_timestamp
