@@ -1,7 +1,7 @@
 // ============================================================================
-// NIROG HEALTH MONITOR - I2C POLLED MODE (NO INTERRUPTS)
+// NIROG HEALTH MONITOR - NEW I2C DRIVER (FIXED)
 // ECG 125Hz, PPG 50Hz, Packets 25Hz, BLE 25Hz
-// FIX: Disables I2C interrupts to prevent collision with BLE
+// Uses: driver/i2c_master.h with proper timeout settings
 // ============================================================================
 
 #include <stdio.h>
@@ -12,7 +12,7 @@
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "driver/i2c.h"
+#include "driver/i2c_master.h"
 #include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
 #include "nvs_flash.h"
@@ -39,12 +39,10 @@
 #define ECG_ADC_CH           ADC_CHANNEL_1
 #define LO_PLUS              GPIO_NUM_16
 #define LO_MINUS             GPIO_NUM_17
-#define I2C_SCL_PPG          9
-#define I2C_SDA_PPG          8
-#define I2C_PORT_PPG         I2C_NUM_0
-#define I2C_SCL_FG           11
-#define I2C_SDA_FG           10
-#define I2C_PORT_FG          I2C_NUM_1
+#define I2C_SCL_PPG          GPIO_NUM_9
+#define I2C_SDA_PPG          GPIO_NUM_8
+#define I2C_SCL_FG           GPIO_NUM_11
+#define I2C_SDA_FG           GPIO_NUM_10
 
 // I2C addresses
 #define MAX30101_ADDR        0x57
@@ -80,6 +78,12 @@ static TaskHandle_t acq_task_h = NULL;
 static TaskHandle_t ble_task_h = NULL;
 static QueueHandle_t packet_queue = NULL;
 
+// NEW I2C driver handles
+static i2c_master_bus_handle_t i2c_bus_ppg = NULL;
+static i2c_master_bus_handle_t i2c_bus_fg = NULL;
+static i2c_master_dev_handle_t max30101_dev = NULL;
+static i2c_master_dev_handle_t max17048_dev = NULL;
+
 static uint8_t leads = 0xFF;
 static float batt_v = 0.0f;
 static float batt_pct = 0.0f;
@@ -112,52 +116,103 @@ static uint16_t crc16(uint8_t *data, size_t len) {
 }
 
 // ============================================================================
-// HARDWARE INIT - POLLED MODE (NO INTERRUPTS!)
+// NEW I2C DRIVER FUNCTIONS (FIXED TIMEOUT)
 // ============================================================================
 
-static void init_i2c(i2c_port_t port, int sda, int scl) {
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = sda,
-        .scl_io_num = scl,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = 400000,
+static esp_err_t init_i2c_ppg(void) {
+    i2c_master_bus_config_t bus_config = {
+        .i2c_port = I2C_NUM_0,
+        .sda_io_num = I2C_SDA_PPG,
+        .scl_io_num = I2C_SCL_PPG,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
     };
-    i2c_param_config(port, &conf);
     
-    // CRITICAL FIX: Set intr_alloc_flags = 0 to DISABLE interrupts!
-    // This prevents I2C interrupt collision with BLE interrupts
-    i2c_driver_install(port, I2C_MODE_MASTER, 0, 0, 0);  // Last param = 0 → NO INTERRUPTS!
+    esp_err_t ret = i2c_new_master_bus(&bus_config, &i2c_bus_ppg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "I2C bus init failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
     
-    ESP_LOGI(TAG, "I2C port %d: POLLED MODE (no interrupts)", port);
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = MAX30101_ADDR,
+        .scl_speed_hz = 200000,  // 100kHz for better reliability
+    };
+    
+    ret = i2c_master_bus_add_device(i2c_bus_ppg, &dev_cfg, &max30101_dev);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "MAX30101 device add failed: %s", esp_err_to_name(ret));
+    }
+    return ret;
 }
 
-static void i2c_write(i2c_port_t port, uint8_t addr, uint8_t reg, uint8_t val) {
+static esp_err_t init_i2c_fg(void) {
+    i2c_master_bus_config_t bus_config = {
+        .i2c_port = I2C_NUM_1,
+        .sda_io_num = I2C_SDA_FG,
+        .scl_io_num = I2C_SCL_FG,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = false,
+    };
+    
+    esp_err_t ret = i2c_new_master_bus(&bus_config, &i2c_bus_fg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "I2C bus FG init failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = MAX17048_ADDR,
+        .scl_speed_hz = 100000,  // 100kHz for better reliability
+    };
+    
+    ret = i2c_master_bus_add_device(i2c_bus_fg, &dev_cfg, &max17048_dev);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "MAX17048 device add failed: %s", esp_err_to_name(ret));
+    }
+    return ret;
+}
+
+static esp_err_t i2c_write_reg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t val) {
     uint8_t buf[2] = {reg, val};
-    i2c_master_write_to_device(port, addr, buf, 2, pdMS_TO_TICKS(10));
+    return i2c_master_transmit(dev, buf, 2, 1000);  // 1000ms timeout
 }
 
-static esp_err_t i2c_read(i2c_port_t port, uint8_t addr, uint8_t reg, uint8_t *data, size_t len) {
-    return i2c_master_write_read_device(port, addr, &reg, 1, data, len, pdMS_TO_TICKS(10));
+static esp_err_t i2c_read_reg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t *data, size_t len) {
+    return i2c_master_transmit_receive(dev, &reg, 1, data, len, 1000);  // 1000ms timeout
 }
 
 static void init_max30101(void) {
-    // Reset
-    i2c_write(I2C_PORT_PPG, MAX30101_ADDR, 0x09, 0x40);
+    esp_err_t ret;
+    
+    ret = i2c_write_reg(max30101_dev, 0x09, 0x40);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "MAX30101 reset failed: %s", esp_err_to_name(ret));
+        return;
+    }
     vTaskDelay(pdMS_TO_TICKS(50));
     
-    // Configure for 50 Hz
-    i2c_write(I2C_PORT_PPG, MAX30101_ADDR, 0x04, 0x00);
-    i2c_write(I2C_PORT_PPG, MAX30101_ADDR, 0x05, 0x00);
-    i2c_write(I2C_PORT_PPG, MAX30101_ADDR, 0x06, 0x00);
-    i2c_write(I2C_PORT_PPG, MAX30101_ADDR, 0x08, 0x0F);
-    i2c_write(I2C_PORT_PPG, MAX30101_ADDR, 0x09, 0x03);
-    i2c_write(I2C_PORT_PPG, MAX30101_ADDR, 0x0A, 0x27);
-    i2c_write(I2C_PORT_PPG, MAX30101_ADDR, 0x0C, 0x24);
-    i2c_write(I2C_PORT_PPG, MAX30101_ADDR, 0x0D, 0x24);
+    i2c_write_reg(max30101_dev, 0x04, 0x00);
+    i2c_write_reg(max30101_dev, 0x05, 0x00);
+    i2c_write_reg(max30101_dev, 0x06, 0x00);
+    i2c_write_reg(max30101_dev, 0x08, 0x0F);
+    i2c_write_reg(max30101_dev, 0x09, 0x03);
+    i2c_write_reg(max30101_dev, 0x0A, 0x27);
+    i2c_write_reg(max30101_dev, 0x0C, 0x24);
+    i2c_write_reg(max30101_dev, 0x0D, 0x24);
     
-    ESP_LOGI(TAG, "MAX30101: 50Hz mode (polled I2C)");
+    // Verify device responds
+    uint8_t part_id = 0;
+    ret = i2c_read_reg(max30101_dev, 0xFF, &part_id, 1);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "MAX30101: ID=0x%02X (NEW I2C OK)", part_id);
+    } else {
+        ESP_LOGE(TAG, "MAX30101: Read failed");
+    }
 }
 
 // ============================================================================
@@ -188,9 +243,8 @@ static void acquisition_task(void *arg) {
         ecg_cnt++;
         
         // EVERY 2.5 CYCLES (~50 Hz): Read PPG
-        // Now in POLLED mode - no interrupts!
         if (cycle == 0 || cycle == 2) {
-            if (i2c_read(I2C_PORT_PPG, MAX30101_ADDR, 0x07, fifo, 6) == ESP_OK) {
+            if (i2c_read_reg(max30101_dev, 0x07, fifo, 6) == ESP_OK) {
                 uint32_t red = ((uint32_t)fifo[0] << 16) | ((uint32_t)fifo[1] << 8) | fifo[2];
                 uint32_t ir = ((uint32_t)fifo[3] << 16) | ((uint32_t)fifo[4] << 8) | fifo[5];
                 
@@ -203,31 +257,28 @@ static void acquisition_task(void *arg) {
         
         // CYCLE 0: Read aux sensors + lead status
         if (cycle == 0) {
-            // Lead status
             leads = 0;
             if (gpio_get_level(LO_PLUS)) leads |= 0x01;
             if (gpio_get_level(LO_MINUS)) leads |= 0x02;
             
-            // Battery (polled I2C - no interrupts)
             uint8_t buf[2];
-            if (i2c_read(I2C_PORT_FG, MAX17048_ADDR, 0x02, buf, 2) == ESP_OK) {
+            if (i2c_read_reg(max17048_dev, 0x02, buf, 2) == ESP_OK) {
                 uint16_t vcell = (buf[0] << 8) | buf[1];
                 batt_v = (vcell >> 4) * 1.25f / 1000.0f;
             }
-            if (i2c_read(I2C_PORT_FG, MAX17048_ADDR, 0x04, buf, 2) == ESP_OK) {
+            if (i2c_read_reg(max17048_dev, 0x04, buf, 2) == ESP_OK) {
                 uint16_t soc = (buf[0] << 8) | buf[1];
                 batt_pct = (soc >> 8) + (soc & 0xFF) / 256.0f;
             }
             
-            // Temperature
             static uint8_t temp_state = 0;
             if (temp_state == 0) {
-                i2c_write(I2C_PORT_PPG, MAX30101_ADDR, 0x21, 0x01);
+                i2c_write_reg(max30101_dev, 0x21, 0x01);
                 temp_state = 1;
             } else if (temp_state == 5) {
                 uint8_t ti, tf;
-                if (i2c_read(I2C_PORT_PPG, MAX30101_ADDR, 0x1F, &ti, 1) == ESP_OK &&
-                    i2c_read(I2C_PORT_PPG, MAX30101_ADDR, 0x20, &tf, 1) == ESP_OK) {
+                if (i2c_read_reg(max30101_dev, 0x1F, &ti, 1) == ESP_OK &&
+                    i2c_read_reg(max30101_dev, 0x20, &tf, 1) == ESP_OK) {
                     temp = (int8_t)ti + (tf * 0.0625f);
                 }
                 temp_state = 0;
@@ -283,7 +334,7 @@ static void ble_task(void *arg) {
 
 static void monitor_task(void *arg) {
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(10000)); // 10 seconds
+        vTaskDelay(pdMS_TO_TICKS(60000));
         
         ESP_LOGI(TAG, "ECG=%lu PPG=%lu PKT=%lu Q=%d Heap=%lu",
                  ecg_cnt, ppg_cnt, pkt_cnt, 
@@ -381,7 +432,7 @@ static void gatts_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
 // ============================================================================
 
 void app_main(void) {
-    ESP_LOGI(TAG, "=== Nirog I2C Polled Mode v1.0 ===");
+    ESP_LOGI(TAG, "=== Nirog NEW I2C v2.1 ===");
     ESP_LOGI(TAG, "ECG=%dHz PPG=%dHz PKT=%dHz", ECG_RATE_HZ, PPG_RATE_HZ, PACKET_RATE_HZ);
     
     nvs_flash_init();
@@ -396,9 +447,13 @@ void app_main(void) {
         .bitwidth = ADC_BITWIDTH_12, .atten = ADC_ATTEN_DB_12,
     });
     
-    // Initialize I2C in POLLED mode (no interrupts!)
-    init_i2c(I2C_PORT_PPG, I2C_SDA_PPG, I2C_SCL_PPG);
-    init_i2c(I2C_PORT_FG, I2C_SDA_FG, I2C_SCL_FG);
+    // Initialize NEW I2C driver with error checking
+    if (init_i2c_ppg() != ESP_OK) {
+        ESP_LOGE(TAG, "PPG I2C init failed!");
+    }
+    if (init_i2c_fg() != ESP_OK) {
+        ESP_LOGE(TAG, "FG I2C init failed!");
+    }
     init_max30101();
     
     packet_queue = xQueueCreate(PACKET_QUEUE_SIZE, sizeof(packet_t));
@@ -419,5 +474,5 @@ void app_main(void) {
     esp_timer_create(&(esp_timer_create_args_t){.callback = master_timer_cb, .name = "master"}, &master_timer);
     esp_timer_start_periodic(master_timer, MASTER_PERIOD_US);
     
-    ESP_LOGI(TAG, "Running (I2C polled mode - no interrupt conflicts!)");
+    ESP_LOGI(TAG, "Running");
 }
