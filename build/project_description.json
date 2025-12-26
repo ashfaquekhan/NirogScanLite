@@ -1,7 +1,7 @@
 {
     "version":            "1.2",
     "project_name":       "NirogScanLite",
-    "project_version":    "8a336fd-dirty",
+    "project_version":    "8dc9b3b-dirty",
     "project_path":       "C:/Users/ashfa/NirogScanLite",
     "idf_path":           "C:/Users/ashfa/esp/v5.4.1/esp-idf",
     "build_dir":          "C:/Users/ashfa/NirogScanLite/build",
