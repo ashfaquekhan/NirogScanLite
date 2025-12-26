@@ -192,6 +192,7 @@ static void acquisition_task(void *arg) {
                 ppg_idx++;
                 ppg_cnt++;
             }
+            taskYIELD();
         }
         
         // CYCLE 0: Read aux sensors + lead status
@@ -405,9 +406,9 @@ void app_main(void) {
     esp_ble_gap_register_callback(gap_handler);
     esp_ble_gatts_app_register(0);
     
-    xTaskCreatePinnedToCore(acquisition_task, "acq", 4096, NULL, 5, &acq_task_h, 1);
-    xTaskCreatePinnedToCore(ble_task, "ble", 4096, NULL, 6, &ble_task_h, 0);
-    xTaskCreatePinnedToCore(monitor_task, "mon", 4096, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(acquisition_task, "acq", 4096, NULL, 1, &acq_task_h, 1);
+    xTaskCreatePinnedToCore(ble_task, "ble", 4096, NULL, 2, &ble_task_h, 0);
+    xTaskCreatePinnedToCore(monitor_task, "mon", 4096, NULL, 6, NULL, 0);
     
     esp_timer_create(&(esp_timer_create_args_t){.callback = master_timer_cb, .name = "master"}, &master_timer);
     esp_timer_start_periodic(master_timer, MASTER_PERIOD_US);
