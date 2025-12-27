@@ -22,58 +22,70 @@ SERVICE_UUID = "0000180d-0000-1000-8000-00805f9b34fb"
 CHAR_UUID = "00002a37-0000-1000-8000-00805f9b34fb"
 
 PLOT_WINDOW = 500
-UPDATE_RATE_MS = 50  # 20 Hz like reference
+UPDATE_RATE_MS = 50
+PACKET_SIZE = 47
+
+
+def crc16_modbus(data):
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ 0xA001
+            else:
+                crc >>= 1
+    return crc
+
 
 class HealthPacket:
+    __slots__ = ['timestamp', 'seq', 'ecg', 'leads', 'red', 'ir', 
+                 'battery_v', 'battery_pct', 'temp', 'crc', 'crc_valid']
+    
     def __init__(self, data):
-        if len(data) < 47:
-            raise ValueError(f"Packet too short: {len(data)} bytes")
+        if len(data) < PACKET_SIZE:
+            raise ValueError(f"Packet too short: {len(data)} bytes, expected {PACKET_SIZE}")
+        
+        computed_crc = crc16_modbus(data[:-2])
+        received_crc = struct.unpack('<H', data[-2:])[0]
+        self.crc_valid = (computed_crc == received_crc)
         
         offset = 0
-        
-        # uint32_t timestamp
         self.timestamp = struct.unpack('<I', data[offset:offset+4])[0]
         offset += 4
         
-        # uint16_t seq
         self.seq = struct.unpack('<H', data[offset:offset+2])[0]
         offset += 2
         
-        # int16_t ecg[5]
         self.ecg = list(struct.unpack('<hhhhh', data[offset:offset+10]))
         offset += 10
         
-        # uint8_t leads
         self.leads = struct.unpack('<B', data[offset:offset+1])[0]
         offset += 1
         
-        # uint32_t red[2]
         self.red = list(struct.unpack('<II', data[offset:offset+8]))
         offset += 8
         
-        # uint32_t ir[2]
         self.ir = list(struct.unpack('<II', data[offset:offset+8]))
         offset += 8
         
-        # float battery_v
         self.battery_v = struct.unpack('<f', data[offset:offset+4])[0]
         offset += 4
         
-        # float battery_pct
         self.battery_pct = struct.unpack('<f', data[offset:offset+4])[0]
         offset += 4
         
-        # float temp
         self.temp = struct.unpack('<f', data[offset:offset+4])[0]
         offset += 4
         
-        # uint16_t crc
-        self.crc = struct.unpack('<H', data[offset:offset+2])[0]
+        self.crc = received_crc
+
 
 class DataSignals(QObject):
     new_packet = pyqtSignal(object)
     connection_changed = pyqtSignal(bool)
     status_message = pyqtSignal(str)
+
 
 class BLEManager:
     def __init__(self, signals):
@@ -83,6 +95,7 @@ class BLEManager:
         self.packet_count = 0
         self.last_seq = -1
         self.dropped = 0
+        self.crc_errors = 0
         
     async def scan_devices(self):
         self.signals.status_message.emit("Scanning...")
@@ -93,19 +106,24 @@ class BLEManager:
         try:
             packet = HealthPacket(data)
             
-            # Check for dropped packets
+            if not packet.crc_valid:
+                self.crc_errors += 1
+                print(f"[WARN] CRC error #{self.crc_errors} (seq={packet.seq})")
+                return
+            
             if self.last_seq >= 0:
                 expected = (self.last_seq + 1) & 0xFFFF
                 if packet.seq != expected:
                     dropped = (packet.seq - expected) & 0xFFFF
-                    self.dropped += dropped
-                    print(f"[WARN] Dropped {dropped} packets (seq {expected} → {packet.seq})")
+                    if dropped < 1000:
+                        self.dropped += dropped
+                        print(f"[WARN] Dropped {dropped} packets (seq {expected} -> {packet.seq})")
             
             self.last_seq = packet.seq
             self.packet_count += 1
             
-            if self.packet_count % 100 == 0:
-                print(f"[INFO] Received {self.packet_count} packets, dropped {self.dropped}")
+            if self.packet_count % 250 == 0:
+                print(f"[INFO] Packets: {self.packet_count}, Dropped: {self.dropped}, CRC Errors: {self.crc_errors}")
             
             self.signals.new_packet.emit(packet)
         except Exception as e:
@@ -113,18 +131,24 @@ class BLEManager:
     
     async def connect(self, device):
         try:
-            self.signals.status_message.emit(f"Connecting...")
+            self.signals.status_message.emit("Connecting...")
             self.client = BleakClient(device.address)
             await self.client.connect()
             
             if self.client.is_connected:
+                try:
+                    await self.client.request_mtu(185)
+                except Exception:
+                    pass
+                
                 await self.client.start_notify(CHAR_UUID, self.notification_handler)
                 self.connected = True
                 self.packet_count = 0
                 self.last_seq = -1
                 self.dropped = 0
+                self.crc_errors = 0
                 self.signals.connection_changed.emit(True)
-                self.signals.status_message.emit(f"Connected")
+                self.signals.status_message.emit("Connected")
                 return True
         except Exception as e:
             self.signals.status_message.emit(f"Failed: {e}")
@@ -137,31 +161,68 @@ class BLEManager:
             try:
                 await self.client.stop_notify(CHAR_UUID)
                 await self.client.disconnect()
-            except:
+            except Exception:
                 pass
         self.connected = False
         self.signals.connection_changed.emit(False)
         self.signals.status_message.emit("Disconnected")
 
+
+class CircularBuffer:
+    def __init__(self, size, dtype=np.float32):
+        self.size = size
+        self.data = np.zeros(size, dtype=dtype)
+        self.write_idx = 0
+        self.count = 0
+        self.lock = Lock()
+    
+    def append(self, value):
+        with self.lock:
+            self.data[self.write_idx] = value
+            self.write_idx = (self.write_idx + 1) % self.size
+            if self.count < self.size:
+                self.count += 1
+    
+    def extend(self, values):
+        with self.lock:
+            for v in values:
+                self.data[self.write_idx] = v
+                self.write_idx = (self.write_idx + 1) % self.size
+            self.count = min(self.count + len(values), self.size)
+    
+    def get_ordered(self):
+        with self.lock:
+            if self.count < self.size:
+                return self.data[:self.count].copy()
+            else:
+                return np.concatenate([
+                    self.data[self.write_idx:],
+                    self.data[:self.write_idx]
+                ])
+    
+    def clear(self):
+        with self.lock:
+            self.data.fill(0)
+            self.write_idx = 0
+            self.count = 0
+
+
 class NirogScanGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("NirogScan - Optimized")
+        self.setWindowTitle("NirogScan v2.3")
         self.setGeometry(100, 100, 1400, 900)
         
         self.signals = DataSignals()
         self.ble_manager = BLEManager(self.signals)
         
-        # Use numpy arrays for fast plotting
-        self.plot_size = PLOT_WINDOW
-        self.ecg_data = np.zeros(self.plot_size, dtype=np.int16)
-        self.ppg_red_data = np.zeros(self.plot_size, dtype=np.uint32)
-        self.ppg_ir_data = np.zeros(self.plot_size, dtype=np.uint32)
-        
-        self.ecg_idx = 0
-        self.ppg_idx = 0
+        self.ecg_buffer = CircularBuffer(PLOT_WINDOW, dtype=np.int16)
+        self.ppg_red_buffer = CircularBuffer(PLOT_WINDOW, dtype=np.uint32)
+        self.ppg_ir_buffer = CircularBuffer(PLOT_WINDOW, dtype=np.uint32)
         
         self.packet_count = 0
+        self.last_packet = None
+        self.data_lock = Lock()
         
         self.setup_ui()
         self.connect_signals()
@@ -175,7 +236,6 @@ class NirogScanGUI(QMainWindow):
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
         
-        # Connection controls
         ctrl_group = QGroupBox("Connection")
         ctrl_layout = QHBoxLayout()
         
@@ -201,7 +261,6 @@ class NirogScanGUI(QMainWindow):
         ctrl_group.setLayout(ctrl_layout)
         layout.addWidget(ctrl_group)
         
-        # Status display
         status_group = QGroupBox("Status")
         status_layout = QGridLayout()
         
@@ -209,31 +268,27 @@ class NirogScanGUI(QMainWindow):
         font.setPointSize(10)
         font.setBold(True)
         
-        status_layout.addWidget(QLabel("Packets:"), 0, 0)
-        self.packet_label = QLabel("0")
-        self.packet_label.setFont(font)
-        status_layout.addWidget(self.packet_label, 0, 1)
+        labels = [
+            ("Packets:", "packet_label", "0"),
+            ("Dropped:", "dropped_label", "0"),
+            ("CRC Err:", "crc_label", "0"),
+            ("Battery:", "battery_label", "-.--V"),
+            ("Temp:", "temp_label", "--.-°C"),
+            ("Leads:", "leads_label", "--"),
+            ("Seq:", "seq_label", "0"),
+        ]
         
-        status_layout.addWidget(QLabel("Battery:"), 0, 2)
-        self.battery_label = QLabel("-.--V")
-        self.battery_label.setFont(font)
-        status_layout.addWidget(self.battery_label, 0, 3)
+        for col, (text, attr, default) in enumerate(labels):
+            status_layout.addWidget(QLabel(text), 0, col * 2)
+            label = QLabel(default)
+            label.setFont(font)
+            setattr(self, attr, label)
+            status_layout.addWidget(label, 0, col * 2 + 1)
         
-        status_layout.addWidget(QLabel("Temp:"), 0, 4)
-        self.temp_label = QLabel("--.-°C")
-        self.temp_label.setFont(font)
-        status_layout.addWidget(self.temp_label, 0, 5)
-        
-        status_layout.addWidget(QLabel("Leads:"), 0, 6)
-        self.leads_label = QLabel("--")
-        self.leads_label.setFont(font)
-        status_layout.addWidget(self.leads_label, 0, 7)
-        
-        status_layout.setColumnStretch(8, 1)
+        status_layout.setColumnStretch(len(labels) * 2, 1)
         status_group.setLayout(status_layout)
         layout.addWidget(status_group)
         
-        # ECG plot
         self.ecg_plot = pg.PlotWidget(title="ECG (125 Hz)")
         self.ecg_plot.setBackground('#1e1e1e')
         self.ecg_plot.setLabel('left', 'ADC')
@@ -244,8 +299,7 @@ class NirogScanGUI(QMainWindow):
         self.ecg_curve = self.ecg_plot.plot(pen=pg.mkPen(color='#00ff00', width=1))
         layout.addWidget(self.ecg_plot)
         
-        # PPG Red plot
-        self.ppg_red_plot = pg.PlotWidget(title="PPG Red (50 Hz)")
+        self.ppg_red_plot = pg.PlotWidget(title="PPG Red (25 Hz)")
         self.ppg_red_plot.setBackground('#1e1e1e')
         self.ppg_red_plot.setLabel('left', 'Counts')
         self.ppg_red_plot.showGrid(x=True, y=True, alpha=0.3)
@@ -254,8 +308,7 @@ class NirogScanGUI(QMainWindow):
         self.ppg_red_curve = self.ppg_red_plot.plot(pen=pg.mkPen(color='#ff0000', width=1))
         layout.addWidget(self.ppg_red_plot)
         
-        # PPG IR plot
-        self.ppg_ir_plot = pg.PlotWidget(title="PPG IR (50 Hz)")
+        self.ppg_ir_plot = pg.PlotWidget(title="PPG IR (25 Hz)")
         self.ppg_ir_plot.setBackground('#1e1e1e')
         self.ppg_ir_plot.setLabel('left', 'Counts')
         self.ppg_ir_plot.showGrid(x=True, y=True, alpha=0.3)
@@ -329,11 +382,9 @@ class NirogScanGUI(QMainWindow):
                 self.connect_btn.setEnabled(True)
             else:
                 self.packet_count = 0
-                self.ecg_data.fill(0)
-                self.ppg_red_data.fill(0)
-                self.ppg_ir_data.fill(0)
-                self.ecg_idx = 0
-                self.ppg_idx = 0
+                self.ecg_buffer.clear()
+                self.ppg_red_buffer.clear()
+                self.ppg_ir_buffer.clear()
     
     @asyncSlot()
     async def on_disconnect_clicked(self):
@@ -352,47 +403,53 @@ class NirogScanGUI(QMainWindow):
     def on_new_packet(self, packet):
         self.packet_count += 1
         
-        # Add ECG data using circular buffer
-        for val in packet.ecg:
-            self.ecg_data[self.ecg_idx] = val
-            self.ecg_idx = (self.ecg_idx + 1) % self.plot_size
+        self.ecg_buffer.extend(packet.ecg)
         
-        # Add PPG data (filter zeros)
-        for i in range(len(packet.red)):
-            if packet.red[i] > 1000:
-                self.ppg_red_data[self.ppg_idx] = packet.red[i]
-                self.ppg_ir_data[self.ppg_idx] = packet.ir[i]
-                self.ppg_idx = (self.ppg_idx + 1) % self.plot_size
+        if packet.red[0] > 0:
+            self.ppg_red_buffer.append(packet.red[0])
+            self.ppg_ir_buffer.append(packet.ir[0])
         
-        # Update labels every 10 packets
-        if self.packet_count % 10 == 0:
-            self.packet_label.setText(str(self.packet_count))
-            self.battery_label.setText(f"{packet.battery_v:.2f}V ({packet.battery_pct:.0f}%)")
-            self.temp_label.setText(f"{packet.temp:.1f}°C")
-            
-            lead_text = "OK" if packet.leads == 0 else "OFF"
-            self.leads_label.setText(lead_text)
-            if packet.leads != 0:
-                self.leads_label.setStyleSheet("color: #ff5555; font-weight: bold;")
-            else:
-                self.leads_label.setStyleSheet("color: #55ff55; font-weight: bold;")
+        with self.data_lock:
+            self.last_packet = packet
     
     def update_plots(self):
-        # Reorder circular buffer for display (put oldest data first)
-        ecg_display = np.roll(self.ecg_data, -self.ecg_idx)
-        ppg_red_display = np.roll(self.ppg_red_data, -self.ppg_idx)
-        ppg_ir_display = np.roll(self.ppg_ir_data, -self.ppg_idx)
+        ecg_data = self.ecg_buffer.get_ordered()
+        ppg_red_data = self.ppg_red_buffer.get_ordered()
+        ppg_ir_data = self.ppg_ir_buffer.get_ordered()
         
-        # Update plots with numpy arrays (much faster than list)
-        self.ecg_curve.setData(ecg_display)
-        self.ppg_red_curve.setData(ppg_red_display)
-        self.ppg_ir_curve.setData(ppg_ir_display)
+        self.ecg_curve.setData(ecg_data)
+        self.ppg_red_curve.setData(ppg_red_data)
+        self.ppg_ir_curve.setData(ppg_ir_data)
+        
+        with self.data_lock:
+            packet = self.last_packet
+        
+        if packet:
+            self.packet_label.setText(str(self.packet_count))
+            self.dropped_label.setText(str(self.ble_manager.dropped))
+            self.crc_label.setText(str(self.ble_manager.crc_errors))
+            self.battery_label.setText(f"{packet.battery_v:.2f}V ({packet.battery_pct:.0f}%)")
+            self.temp_label.setText(f"{packet.temp:.1f}°C")
+            self.seq_label.setText(str(packet.seq))
+            
+            if packet.leads == 0:
+                self.leads_label.setText("OK")
+                self.leads_label.setStyleSheet("color: #55ff55; font-weight: bold;")
+            else:
+                status = []
+                if packet.leads & 0x01:
+                    status.append("LO+")
+                if packet.leads & 0x02:
+                    status.append("LO-")
+                self.leads_label.setText(" ".join(status) if status else "ERR")
+                self.leads_label.setStyleSheet("color: #ff5555; font-weight: bold;")
     
     def closeEvent(self, event):
         if self.ble_manager.connected:
             loop = asyncio.get_event_loop()
             loop.run_until_complete(self.ble_manager.disconnect())
         event.accept()
+
 
 def main():
     app = QApplication(sys.argv)
@@ -402,6 +459,7 @@ def main():
     window.show()
     with loop:
         loop.run_forever()
+
 
 if __name__ == '__main__':
     main()
