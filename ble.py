@@ -220,7 +220,7 @@ class CircularBuffer:
 class NirogScanGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("NirogScan v2.9")
+        self.setWindowTitle("NirogScanLite")
         self.setGeometry(100, 100, 1400, 900)
         
         self.signals = DataSignals()

@@ -477,7 +477,7 @@ static void gatts_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
 }
 
 void app_main(void) {
-    ESP_LOGI(TAG, "=== Nirog v2.9 ===");
+    ESP_LOGI(TAG, "=== NirogScanLite ===");
     ESP_LOGI(TAG, "ECG=%dHz PPG=%dHz PKT=%dHz SIZE=%d", 
              ECG_RATE_HZ, PPG_RATE_HZ, PACKET_RATE_HZ, sizeof(packet_t));
     
