@@ -1,7 +1,6 @@
 import sys
 import asyncio
 import struct
-from collections import deque
 from threading import Lock
 
 from PyQt5.QtWidgets import *
@@ -21,9 +20,15 @@ DEVICE_NAME = "NirogScan"
 SERVICE_UUID = "0000180d-0000-1000-8000-00805f9b34fb"
 CHAR_UUID = "00002a37-0000-1000-8000-00805f9b34fb"
 
-PLOT_WINDOW = 500
+ECG_WINDOW = 625
+PPG_WINDOW = 125
 UPDATE_RATE_MS = 50
 PACKET_SIZE = 47
+
+AD8232_GAIN = 1000
+ADC_VREF_MV = 3300
+ADC_MAX = 4095
+ADC_MID = 2048
 
 
 def crc16_modbus(data):
@@ -38,13 +43,17 @@ def crc16_modbus(data):
     return crc
 
 
+def adc_to_uv(adc_raw):
+    return (adc_raw - ADC_MID) * ADC_VREF_MV * 1000.0 / (ADC_MAX * AD8232_GAIN)
+
+
 class HealthPacket:
-    __slots__ = ['timestamp', 'seq', 'ecg', 'leads', 'red', 'ir', 
+    __slots__ = ['timestamp', 'seq', 'ecg_raw', 'ecg_uv', 'leads', 'red', 'ir', 
                  'battery_v', 'battery_pct', 'temp', 'crc', 'crc_valid']
     
     def __init__(self, data):
         if len(data) < PACKET_SIZE:
-            raise ValueError(f"Packet too short: {len(data)} bytes, expected {PACKET_SIZE}")
+            raise ValueError(f"Packet too short: {len(data)}")
         
         computed_crc = crc16_modbus(data[:-2])
         received_crc = struct.unpack('<H', data[-2:])[0]
@@ -57,7 +66,8 @@ class HealthPacket:
         self.seq = struct.unpack('<H', data[offset:offset+2])[0]
         offset += 2
         
-        self.ecg = list(struct.unpack('<hhhhh', data[offset:offset+10]))
+        self.ecg_raw = list(struct.unpack('<hhhhh', data[offset:offset+10]))
+        self.ecg_uv = [adc_to_uv(x) for x in self.ecg_raw]
         offset += 10
         
         self.leads = struct.unpack('<B', data[offset:offset+1])[0]
@@ -108,7 +118,6 @@ class BLEManager:
             
             if not packet.crc_valid:
                 self.crc_errors += 1
-                print(f"[WARN] CRC error #{self.crc_errors} (seq={packet.seq})")
                 return
             
             if self.last_seq >= 0:
@@ -117,17 +126,13 @@ class BLEManager:
                     dropped = (packet.seq - expected) & 0xFFFF
                     if dropped < 1000:
                         self.dropped += dropped
-                        print(f"[WARN] Dropped {dropped} packets (seq {expected} -> {packet.seq})")
             
             self.last_seq = packet.seq
             self.packet_count += 1
-            
-            if self.packet_count % 250 == 0:
-                print(f"[INFO] Packets: {self.packet_count}, Dropped: {self.dropped}, CRC Errors: {self.crc_errors}")
-            
             self.signals.new_packet.emit(packet)
+            
         except Exception as e:
-            print(f"[ERROR] Parse error: {e}, len={len(data)}")
+            print(f"[ERROR] {e}")
     
     async def connect(self, device):
         try:
@@ -138,7 +143,7 @@ class BLEManager:
             if self.client.is_connected:
                 try:
                     await self.client.request_mtu(185)
-                except Exception:
+                except:
                     pass
                 
                 await self.client.start_notify(CHAR_UUID, self.notification_handler)
@@ -161,7 +166,7 @@ class BLEManager:
             try:
                 await self.client.stop_notify(CHAR_UUID)
                 await self.client.disconnect()
-            except Exception:
+            except:
                 pass
         self.connected = False
         self.signals.connection_changed.emit(False)
@@ -172,53 +177,49 @@ class CircularBuffer:
     def __init__(self, size, dtype=np.float32):
         self.size = size
         self.data = np.zeros(size, dtype=dtype)
-        self.write_idx = 0
+        self.idx = 0
         self.count = 0
         self.lock = Lock()
-    
-    def append(self, value):
-        with self.lock:
-            self.data[self.write_idx] = value
-            self.write_idx = (self.write_idx + 1) % self.size
-            if self.count < self.size:
-                self.count += 1
     
     def extend(self, values):
         with self.lock:
             for v in values:
-                self.data[self.write_idx] = v
-                self.write_idx = (self.write_idx + 1) % self.size
+                self.data[self.idx] = v
+                self.idx = (self.idx + 1) % self.size
             self.count = min(self.count + len(values), self.size)
+    
+    def append(self, value):
+        with self.lock:
+            self.data[self.idx] = value
+            self.idx = (self.idx + 1) % self.size
+            if self.count < self.size:
+                self.count += 1
     
     def get_ordered(self):
         with self.lock:
             if self.count < self.size:
                 return self.data[:self.count].copy()
-            else:
-                return np.concatenate([
-                    self.data[self.write_idx:],
-                    self.data[:self.write_idx]
-                ])
+            return np.concatenate([self.data[self.idx:], self.data[:self.idx]])
     
     def clear(self):
         with self.lock:
             self.data.fill(0)
-            self.write_idx = 0
+            self.idx = 0
             self.count = 0
 
 
 class NirogScanGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("NirogScan v2.3")
+        self.setWindowTitle("NirogScan v2.6")
         self.setGeometry(100, 100, 1400, 900)
         
         self.signals = DataSignals()
         self.ble_manager = BLEManager(self.signals)
         
-        self.ecg_buffer = CircularBuffer(PLOT_WINDOW, dtype=np.int16)
-        self.ppg_red_buffer = CircularBuffer(PLOT_WINDOW, dtype=np.uint32)
-        self.ppg_ir_buffer = CircularBuffer(PLOT_WINDOW, dtype=np.uint32)
+        self.ecg_buffer = CircularBuffer(ECG_WINDOW, dtype=np.float32)
+        self.ppg_red_buffer = CircularBuffer(PPG_WINDOW, dtype=np.uint32)
+        self.ppg_ir_buffer = CircularBuffer(PPG_WINDOW, dtype=np.uint32)
         
         self.packet_count = 0
         self.last_packet = None
@@ -275,7 +276,6 @@ class NirogScanGUI(QMainWindow):
             ("Battery:", "battery_label", "-.--V"),
             ("Temp:", "temp_label", "--.-°C"),
             ("Leads:", "leads_label", "--"),
-            ("Seq:", "seq_label", "0"),
         ]
         
         for col, (text, attr, default) in enumerate(labels):
@@ -289,32 +289,27 @@ class NirogScanGUI(QMainWindow):
         status_group.setLayout(status_layout)
         layout.addWidget(status_group)
         
-        self.ecg_plot = pg.PlotWidget(title="ECG (125 Hz)")
+        self.ecg_plot = pg.PlotWidget(title="ECG (125Hz, Gain=1000)")
         self.ecg_plot.setBackground('#1e1e1e')
-        self.ecg_plot.setLabel('left', 'ADC')
+        self.ecg_plot.setLabel('left', 'µV')
+        self.ecg_plot.setLabel('bottom', 'Samples (5s window)')
         self.ecg_plot.showGrid(x=True, y=True, alpha=0.3)
-        self.ecg_plot.setDownsampling(mode='peak')
-        self.ecg_plot.setClipToView(True)
-        self.ecg_plot.setRange(xRange=[0, PLOT_WINDOW], yRange=[0, 4096])
-        self.ecg_curve = self.ecg_plot.plot(pen=pg.mkPen(color='#00ff00', width=1))
+        self.ecg_plot.setRange(xRange=[0, ECG_WINDOW], yRange=[-1500, 1500])
+        self.ecg_curve = self.ecg_plot.plot(pen=pg.mkPen(color='#00ff00', width=1.5))
         layout.addWidget(self.ecg_plot)
         
-        self.ppg_red_plot = pg.PlotWidget(title="PPG Red (25 Hz)")
+        self.ppg_red_plot = pg.PlotWidget(title="PPG Red (25Hz)")
         self.ppg_red_plot.setBackground('#1e1e1e')
         self.ppg_red_plot.setLabel('left', 'Counts')
         self.ppg_red_plot.showGrid(x=True, y=True, alpha=0.3)
-        self.ppg_red_plot.setDownsampling(mode='peak')
-        self.ppg_red_plot.setClipToView(True)
-        self.ppg_red_curve = self.ppg_red_plot.plot(pen=pg.mkPen(color='#ff0000', width=1))
+        self.ppg_red_curve = self.ppg_red_plot.plot(pen=pg.mkPen(color='#ff0000', width=1.5))
         layout.addWidget(self.ppg_red_plot)
         
-        self.ppg_ir_plot = pg.PlotWidget(title="PPG IR (25 Hz)")
+        self.ppg_ir_plot = pg.PlotWidget(title="PPG IR (25Hz)")
         self.ppg_ir_plot.setBackground('#1e1e1e')
         self.ppg_ir_plot.setLabel('left', 'Counts')
         self.ppg_ir_plot.showGrid(x=True, y=True, alpha=0.3)
-        self.ppg_ir_plot.setDownsampling(mode='peak')
-        self.ppg_ir_plot.setClipToView(True)
-        self.ppg_ir_curve = self.ppg_ir_plot.plot(pen=pg.mkPen(color='#ff00ff', width=1))
+        self.ppg_ir_curve = self.ppg_ir_plot.plot(pen=pg.mkPen(color='#ff00ff', width=1.5))
         layout.addWidget(self.ppg_ir_plot)
         
         self.statusBar = QStatusBar()
@@ -323,29 +318,12 @@ class NirogScanGUI(QMainWindow):
         
         self.setStyleSheet("""
             QMainWindow { background-color: #2b2b2b; }
-            QGroupBox {
-                border: 2px solid #555555;
-                border-radius: 5px;
-                margin-top: 10px;
-                font-weight: bold;
-                color: #ffffff;
-            }
-            QLabel { color: #ffffff; }
-            QPushButton {
-                background-color: #3d3d3d;
-                color: #ffffff;
-                border: 1px solid #555555;
-                border-radius: 3px;
-                padding: 5px 15px;
-            }
+            QGroupBox { border: 2px solid #555; border-radius: 5px; margin-top: 10px; font-weight: bold; color: #fff; }
+            QLabel { color: #fff; }
+            QPushButton { background-color: #3d3d3d; color: #fff; border: 1px solid #555; border-radius: 3px; padding: 5px 15px; }
             QPushButton:hover { background-color: #4d4d4d; }
-            QPushButton:disabled { background-color: #2d2d2d; color: #666666; }
-            QComboBox {
-                background-color: #3d3d3d;
-                color: #ffffff;
-                border: 1px solid #555555;
-                padding: 5px;
-            }
+            QPushButton:disabled { background-color: #2d2d2d; color: #666; }
+            QComboBox { background-color: #3d3d3d; color: #fff; border: 1px solid #555; padding: 5px; }
         """)
     
     def connect_signals(self):
@@ -403,7 +381,7 @@ class NirogScanGUI(QMainWindow):
     def on_new_packet(self, packet):
         self.packet_count += 1
         
-        self.ecg_buffer.extend(packet.ecg)
+        self.ecg_buffer.extend(packet.ecg_uv)
         
         if packet.red[0] > 0:
             self.ppg_red_buffer.append(packet.red[0])
@@ -421,6 +399,17 @@ class NirogScanGUI(QMainWindow):
         self.ppg_red_curve.setData(ppg_red_data)
         self.ppg_ir_curve.setData(ppg_ir_data)
         
+        if len(ppg_red_data) > 10:
+            margin = 0.1
+            red_min, red_max = np.min(ppg_red_data), np.max(ppg_red_data)
+            ir_min, ir_max = np.min(ppg_ir_data), np.max(ppg_ir_data)
+            if red_max > red_min:
+                r = red_max - red_min
+                self.ppg_red_plot.setYRange(red_min - r*margin, red_max + r*margin)
+            if ir_max > ir_min:
+                r = ir_max - ir_min
+                self.ppg_ir_plot.setYRange(ir_min - r*margin, ir_max + r*margin)
+        
         with self.data_lock:
             packet = self.last_packet
         
@@ -430,7 +419,6 @@ class NirogScanGUI(QMainWindow):
             self.crc_label.setText(str(self.ble_manager.crc_errors))
             self.battery_label.setText(f"{packet.battery_v:.2f}V ({packet.battery_pct:.0f}%)")
             self.temp_label.setText(f"{packet.temp:.1f}°C")
-            self.seq_label.setText(str(packet.seq))
             
             if packet.leads == 0:
                 self.leads_label.setText("OK")

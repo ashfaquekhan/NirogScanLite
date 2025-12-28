@@ -25,9 +25,6 @@
 #define MASTER_RATE_HZ       125
 #define MASTER_PERIOD_US     (1000000 / MASTER_RATE_HZ)
 
-#define ECG_PER_PKT          5
-#define PPG_PER_PKT          1
-
 #define ECG_ADC_CH           ADC_CHANNEL_1
 #define LO_PLUS              GPIO_NUM_16
 #define LO_MINUS             GPIO_NUM_17
@@ -58,11 +55,9 @@
 
 #define MAX3010X_MODE_RESET             0x40
 #define MAX3010X_MODE_SPO2              0x03
-
 #define MAX3010X_FIFO_SMP_AVE_4         0x40
 #define MAX3010X_FIFO_ROLLOVER_EN       0x10
 #define MAX3010X_FIFO_A_FULL_17         0x0F
-
 #define MAX3010X_SPO2_ADC_RGE_4096      0x20
 #define MAX3010X_SPO2_SR_100            0x04
 #define MAX3010X_SPO2_PW_411US          0x03
@@ -113,6 +108,7 @@ static volatile bool notify_en = false;
 static volatile uint16_t current_mtu = 23;
 
 static uint8_t temp_state = 0;
+
 static uint32_t last_ppg_red = 0;
 static uint32_t last_ppg_ir = 0;
 static bool ppg_valid = false;
@@ -140,7 +136,7 @@ static esp_err_t init_i2c_ppg(void) {
     
     esp_err_t ret = i2c_new_master_bus(&bus_config, &i2c_bus_ppg);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "PPG I2C bus init failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "PPG I2C bus failed: %s", esp_err_to_name(ret));
         return ret;
     }
     
@@ -152,7 +148,7 @@ static esp_err_t init_i2c_ppg(void) {
     
     ret = i2c_master_bus_add_device(i2c_bus_ppg, &dev_cfg, &max30101_dev);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "MAX30101 device add failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "MAX30101 add failed: %s", esp_err_to_name(ret));
     }
     return ret;
 }
@@ -169,7 +165,7 @@ static esp_err_t init_i2c_fg(void) {
     
     esp_err_t ret = i2c_new_master_bus(&bus_config, &i2c_bus_fg);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "FG I2C bus init failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "FG I2C bus failed: %s", esp_err_to_name(ret));
         return ret;
     }
     
@@ -181,7 +177,7 @@ static esp_err_t init_i2c_fg(void) {
     
     ret = i2c_master_bus_add_device(i2c_bus_fg, &dev_cfg, &max17048_dev);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "MAX17048 device add failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "MAX17048 add failed: %s", esp_err_to_name(ret));
     }
     return ret;
 }
@@ -277,9 +273,8 @@ static void acquisition_task(void *arg) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         
         int adc_val = 0;
-        if (adc_oneshot_read(adc1, ECG_ADC_CH, &adc_val) == ESP_OK) {
-            pkt.ecg[cycle] = (int16_t)adc_val;
-        }
+        adc_oneshot_read(adc1, ECG_ADC_CH, &adc_val);
+        pkt.ecg[cycle] = (int16_t)adc_val;
         ecg_cnt++;
         
         if (cycle == 0) {
@@ -395,16 +390,12 @@ static void monitor_task(void *arg) {
 }
 
 static void gap_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
-    switch (event) {
-        case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
-            esp_ble_gap_start_advertising(&(esp_ble_adv_params_t){
-                .adv_int_min = 0x20, .adv_int_max = 0x40,
-                .adv_type = ADV_TYPE_IND, .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
-                .channel_map = ADV_CHNL_ALL, .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
-            });
-            break;
-        default:
-            break;
+    if (event == ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT) {
+        esp_ble_gap_start_advertising(&(esp_ble_adv_params_t){
+            .adv_int_min = 0x20, .adv_int_max = 0x40,
+            .adv_type = ADV_TYPE_IND, .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
+            .channel_map = ADV_CHNL_ALL, .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
+        });
     }
 }
 
@@ -415,8 +406,7 @@ static void gatts_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
             gatt_if = gatts_if;
             esp_ble_gap_set_device_name(DEVICE_NAME);
             esp_ble_gap_config_adv_data(&(esp_ble_adv_data_t){
-                .set_scan_rsp = false, .include_name = true,
-                .include_txpower = true,
+                .set_scan_rsp = false, .include_name = true, .include_txpower = true,
                 .flag = ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT,
             });
             esp_ble_gatts_create_service(gatts_if, &(esp_gatt_srvc_id_t){
@@ -482,7 +472,7 @@ static void gatts_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
 }
 
 void app_main(void) {
-    ESP_LOGI(TAG, "=== Nirog v2.4 ===");
+    ESP_LOGI(TAG, "=== Nirog v2.6 ===");
     ESP_LOGI(TAG, "ECG=%dHz PPG=%dHz PKT=%dHz SIZE=%d", 
              ECG_RATE_HZ, PPG_RATE_HZ, PACKET_RATE_HZ, sizeof(packet_t));
     
@@ -506,10 +496,10 @@ void app_main(void) {
     });
     
     if (init_i2c_ppg() != ESP_OK) {
-        ESP_LOGE(TAG, "PPG I2C init failed");
+        ESP_LOGE(TAG, "PPG I2C failed");
     }
     if (init_i2c_fg() != ESP_OK) {
-        ESP_LOGE(TAG, "FG I2C init failed");
+        ESP_LOGE(TAG, "FG I2C failed");
     }
     init_max30101();
     
