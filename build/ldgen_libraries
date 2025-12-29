@@ -83,5 +83,6 @@ C:/Users/ashfa/NirogScanLite/build/esp-idf/spiffs/libspiffs.a
 C:/Users/ashfa/NirogScanLite/build/esp-idf/touch_element/libtouch_element.a
 C:/Users/ashfa/NirogScanLite/build/esp-idf/usb/libusb.a
 C:/Users/ashfa/NirogScanLite/build/esp-idf/wifi_provisioning/libwifi_provisioning.a
-C:/Users/ashfa/NirogScanLite/build/esp-idf/espressif__led_strip/libespressif__led_strip.a
+C:/Users/ashfa/NirogScanLite/build/esp-idf/espressif__tinyusb/libespressif__tinyusb.a
+C:/Users/ashfa/NirogScanLite/build/esp-idf/espressif__esp_tinyusb/libespressif__esp_tinyusb.a
 C:/Users/ashfa/NirogScanLite/build/esp-idf/main/libmain.a
