@@ -1,0 +1,10 @@
+PyQt5
+pyqtgraph
+bleak
+qasync
+numpy
+nuitka
+scipy 
+pywt 
+pandas 
+matplotlib
