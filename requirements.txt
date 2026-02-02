@@ -1,6 +1,6 @@
 PyQt5
 pyqtgraph
-bleak
+bleak==0.21.1
 qasync
 numpy
 nuitka

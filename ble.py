@@ -1,14 +1,4 @@
 #!/usr/bin/env python3
-"""
-NirogScan v4.2 - Medical Device UI with Comprehensive Analysis
-
-Improvements:
-- Proper PPG preprocessing for MAX30102 raw ADC data
-- SpO2 calculation using Red and IR channels
-- Custom peak detection with fallback methods
-- Better handling of short recordings
-- Corrected effective sampling rate handling
-"""
 
 import sys
 import os
