@@ -1,69 +1,88 @@
-| Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-C61 | ESP32-H2 | ESP32-P4 | ESP32-S2 | ESP32-S3 |
-| ----------------- | ----- | -------- | -------- | -------- | -------- | --------- | -------- | -------- | -------- | -------- |
+# NirogScan BLE Application - Setup Instructions
 
-# Blink Example
+## System Requirements
+- **OS**: Windows 10/11 (64-bit)
+- **Python**: 3.10.x (via Anaconda)
+- **RAM**: 8GB minimum (16GB recommended for compilation)
+- **Disk**: 5GB free space
 
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
+## Step 1: Create Conda Environment
+```bash
+# Create new environment
+conda create -n nirogscan_py310 python=3.10 -y
 
-This example demonstrates how to blink a LED by using the GPIO driver or using the [led_strip](https://components.espressif.com/component/espressif/led_strip) library if the LED is addressable e.g. [WS2812](https://cdn-shop.adafruit.com/datasheets/WS2812B.pdf). The `led_strip` library is installed via [component manager](main/idf_component.yml).
-
-## How to Use Example
-
-Before project configuration and build, be sure to set the correct chip target using `idf.py set-target <chip_name>`.
-
-### Hardware Required
-
-* A development board with normal LED or addressable LED on-board (e.g., ESP32-S3-DevKitC, ESP32-C6-DevKitC etc.)
-* A USB cable for Power supply and programming
-
-See [Development Boards](https://www.espressif.com/en/products/devkits) for more information about it.
-
-### Configure the Project
-
-Open the project configuration menu (`idf.py menuconfig`).
-
-In the `Example Configuration` menu:
-
-* Select the LED type in the `Blink LED type` option.
-  * Use `GPIO` for regular LED
-  * Use `LED strip` for addressable LED
-* If the LED type is `LED strip`, select the backend peripheral
-  * `RMT` is only available for ESP targets with RMT peripheral supported
-  * `SPI` is available for all ESP targets
-* Set the GPIO number used for the signal in the `Blink GPIO number` option.
-* Set the blinking period in the `Blink period in ms` option.
-
-### Build and Flash
-
-Run `idf.py -p PORT flash monitor` to build, flash and monitor the project.
-
-(To exit the serial monitor, type ``Ctrl-]``.)
-
-See the [Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/latest/get-started/index.html) for full steps to configure and use ESP-IDF to build projects.
-
-## Example Output
-
-As you run the example, you will see the LED blinking, according to the previously defined period. For the addressable LED, you can also change the LED color by setting the `led_strip_set_pixel(led_strip, 0, 16, 16, 16);` (LED Strip, Pixel Number, Red, Green, Blue) with values from 0 to 255 in the [source file](main/blink_example_main.c).
-
-```text
-I (315) example: Example configured to blink addressable LED!
-I (325) example: Turning the LED OFF!
-I (1325) example: Turning the LED ON!
-I (2325) example: Turning the LED OFF!
-I (3325) example: Turning the LED ON!
-I (4325) example: Turning the LED OFF!
-I (5325) example: Turning the LED ON!
-I (6325) example: Turning the LED OFF!
-I (7325) example: Turning the LED ON!
-I (8325) example: Turning the LED OFF!
+# Activate environment
+conda activate nirogscan_py310
 ```
 
-Note: The color order could be different according to the LED model.
+## Step 2: Install Dependencies
+```bash
+# Install from requirements.txt
+pip install -r requirements.txt
 
-The pixel number indicates the pixel position in the LED strip. For a single LED, use 0.
+# Verify critical packages
+python -c "import PyQt5; print('PyQt5:', PyQt5.Qt.PYQT_VERSION_STR)"
+python -c "import bleak; print('Bleak:', bleak.__version__)"
+python -c "import winrt.windows.foundation.collections; print('WinRT: OK')"
+```
+
+## Step 3: Test Application
+```bash
+# Test BLE application
+python ble.py
+
+# Test Report application
+python report_UI.py
+```
+
+## Step 4: Build with Nuitka
+
+### Option A: Using Build Script (Recommended)
+```bash
+# Run the build script
+build_nuitka.bat
+```
+
+### Option B: Manual Build
+```bash
+# Build ble.py
+python -m nuitka --onefile --windows-console-mode=force --enable-plugin=pyqt5 --follow-imports --include-package=winrt --include-package=winrt.windows --include-package=winrt.windows.foundation --include-package=winrt.windows.foundation.collections --include-package=winrt.windows.devices --include-package=winrt.windows.devices.bluetooth --include-package=winrt.windows.devices.bluetooth.advertisement --include-package=winrt.windows.storage.streams --include-package=bleak --include-package=bleak.backends.winrt ble.py
+
+# Build report_UI.py
+python -m nuitka --onefile --windows-console-mode=force --enable-plugin=pyqt5 --follow-imports --include-package=winrt --include-package=winrt.windows --include-package=winrt.windows.foundation --include-package=winrt.windows.foundation.collections --include-package=winrt.windows.devices --include-package=winrt.windows.devices.bluetooth --include-package=winrt.windows.devices.bluetooth.advertisement --include-package=winrt.windows.storage.streams --include-package=bleak --include-package=bleak.backends.winrt report_UI.py
+```
+
+## Step 5: Alternative - PyInstaller (Easier)
+```bash
+# Build ble.py
+pyinstaller --onefile --console --name=ble_app --collect-all=bleak --collect-all=PyQt5 --collect-all=pyqtgraph --collect-all=scipy --collect-all=numpy --collect-all=pandas ble.py
+
+# Build report_UI.py
+pyinstaller --onefile --console --name=report_app --collect-all=bleak --collect-all=PyQt5 --collect-all=matplotlib --collect-all=pyqtgraph --collect-all=scipy --collect-all=numpy --collect-all=pandas report_UI.py
+
+# Executables will be in: dist/ble_app.exe and dist/report_app.exe
+```
 
 ## Troubleshooting
 
-* If the LED isn't blinking, check the GPIO or the LED type selection in the `Example Configuration` menu.
+### Issue: "ModuleNotFoundError: winrt.windows.foundation.collections"
+**Solution**: 
+```bash
+pip install bleak-winrt --force-reinstall
+python -c "import winrt.windows.foundation.collections; print('OK')"
+```
 
-For any technical queries, please open an [issue](https://github.com/espressif/esp-idf/issues) on GitHub. We will get back to you soon.
+### Issue: "IMPORT_HARD_UNITTEST" error
+**Solution**: Don't use `--nofollow-import-to=unittest` flag
+
+### Issue: Executable doesn't start
+**Solution**: Build with `--windows-console-mode=force` to see errors
+
+### Issue: Bluetooth not working in executable
+**Solution**: Ensure all `winrt.*` packages are included in build command
+
+## Notes
+- Build time: 20-40 minutes per application
+- Final executable size: ~160-180 MB
+- Keep console enabled for debugging
+- Test executable on a clean Windows system before deployment
