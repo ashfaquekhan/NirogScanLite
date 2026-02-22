@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""
+NirogScan v4.3 - Enhanced Dual Sample Analysis
+- Sample 1: Best quality 3-5 cardiac cycles (high SNR)
+- Sample 2: Full recording analysis (if ≥60 seconds)
+- Complete NeuroKit2 feature extraction for ECG and PPG
+"""
 
 import sys
 import os
@@ -64,6 +70,12 @@ PPG_FS = 25
 PPG_EFFECTIVE_FS = 100
 
 MIN_RPEAKS_REQUIRED = 5
+MIN_PPG_PEAKS_REQUIRED = 5
+MIN_DURATION_FOR_SAMPLE2 = 60  # seconds
+
+# Analysis configuration
+# Sample 1: Short, high-quality segment for basic analysis (ECG only)
+# Sample 2: Full recording for comprehensive long-term analysis (both ECG and PPG)
 
 SPO2_LOOKUP = [
     95, 95, 95, 96, 96, 96, 97, 97, 97, 97, 97, 98, 98, 98, 98, 98,
@@ -82,29 +94,29 @@ SPO2_LOOKUP = [
 
 METRIC_EXPLANATIONS = {
     'HRV_MeanNN': ('Average RR Interval', 'Average time between heartbeats. Normal: 600-1000ms.'),
-    'HRV_SDNN': ('Heart Rate Variability', 'How much heartbeat timing varies. Higher = healthier heart. Normal: 50-100ms.'),
-    'HRV_RMSSD': ('Short-term HRV', 'Beat-to-beat changes. Reflects relaxation nervous system. Normal: 20-50ms.'),
-    'HRV_pNN50': ('Large Beat Changes %', 'Percentage of beats differing >50ms. Higher = good health. Normal: 3-25%.'),
-    'HRV_pNN20': ('Small Beat Changes %', 'Percentage of beats differing >20ms. More sensitive measure.'),
-    'HRV_SDSD': ('Successive Diff SD', 'Standard deviation of beat-to-beat differences.'),
-    'HRV_MedianNN': ('Median RR Interval', 'Middle value of RR intervals, less affected by outliers.'),
-    'HRV_VLF': ('Very Low Freq Power', 'Long-term regulation, thermoregulation. Needs 5+ min recording.'),
-    'HRV_LF': ('Low Freq Power', 'Mix of stress and relaxation activity. Normal: 400-1500 ms².'),
-    'HRV_HF': ('High Freq Power', 'Relaxation/parasympathetic activity. Normal: 150-400 ms².'),
-    'HRV_LFHF': ('LF/HF Ratio', 'Stress vs relaxation balance. Normal: 1.5-2.0. Higher = more stress.'),
-    'HRV_SD1': ('Poincaré SD1', 'Short-term variability. Related to RMSSD.'),
-    'HRV_SD2': ('Poincaré SD2', 'Long-term variability. Related to SDNN.'),
-    'HRV_ApEn': ('Approximate Entropy', 'Signal complexity. Lower = more regular heartbeat.'),
-    'HRV_SampEn': ('Sample Entropy', 'Heart rhythm complexity measure.'),
+    'HRV_SDNN': ('Heart Rate Variability', 'How much heartbeat timing varies. Higher = healthier. Normal: 50-100ms.'),
+    'HRV_RMSSD': ('Short-term HRV', 'Beat-to-beat changes. Normal: 20-50ms.'),
+    'HRV_pNN50': ('Large Beat Changes %', 'Percentage of beats >50ms different. Normal: 3-25%.'),
+    'HRV_pNN20': ('Small Beat Changes %', 'Percentage of beats >20ms different.'),
+    'HRV_SDSD': ('Successive Diff SD', 'Standard deviation of differences.'),
+    'HRV_MedianNN': ('Median RR', 'Middle RR value, robust to outliers.'),
+    'HRV_VLF': ('Very Low Freq Power', 'Long-term regulation. Needs 5+ min.'),
+    'HRV_LF': ('Low Freq Power', 'Mixed sympathetic/parasympathetic. Normal: 400-1500 ms².'),
+    'HRV_HF': ('High Freq Power', 'Parasympathetic activity. Normal: 150-400 ms².'),
+    'HRV_LFHF': ('LF/HF Ratio', 'Stress balance. Normal: 1.5-2.0.'),
+    'HRV_SD1': ('Poincaré SD1', 'Short-term variability.'),
+    'HRV_SD2': ('Poincaré SD2', 'Long-term variability.'),
+    'HRV_ApEn': ('Approximate Entropy', 'Signal complexity.'),
+    'HRV_SampEn': ('Sample Entropy', 'Rhythm complexity.'),
     'HRV_DFA_alpha1': ('DFA Short-term', 'Fractal scaling. Normal: 0.75-1.25.'),
     'PR_Interval': ('PR Interval', 'Atrial to ventricular time. Normal: 120-200ms.'),
-    'QRS_Duration': ('QRS Duration', 'Ventricular contraction time. Normal: 80-120ms.'),
-    'QT_Interval': ('QT Interval', 'Total ventricular activity. Varies with heart rate.'),
-    'QTc': ('Corrected QT', 'Heart rate adjusted QT. Normal: <440ms.'),
-    'SpO2': ('Oxygen Saturation', 'Blood oxygen level. Normal: 95-100%.'),
-    'Perfusion_Index': ('Perfusion Index', 'Blood flow strength. Higher = better circulation.'),
-    'PPG_HR': ('Pulse Rate', 'Heart rate from blood flow. Should match ECG heart rate.'),
-    'PRV_SDNN': ('Pulse Rate Variability', 'Variability from PPG. Similar to HRV from ECG.'),
+    'QRS_Duration': ('QRS Duration', 'Ventricular contraction. Normal: 80-120ms.'),
+    'QT_Interval': ('QT Interval', 'Total ventricular activity.'),
+    'QTc': ('Corrected QT', 'HR-adjusted QT. Normal: <440ms.'),
+    'SpO2': ('Oxygen Saturation', 'Blood oxygen. Normal: 95-100%.'),
+    'Perfusion_Index': ('Perfusion Index', 'Blood flow strength.'),
+    'PPG_HR': ('Pulse Rate', 'Heart rate from PPG.'),
+    'PRV_SDNN': ('Pulse Rate Variability', 'PRV from PPG.'),
     'PRV_RMSSD': ('PRV Short-term', 'Beat-to-beat PPG variability.'),
 }
 
@@ -424,15 +436,15 @@ class SignalQualityAnalyzer:
             return 0
 
     @staticmethod
-    def find_best_window(ecg_data: np.ndarray, fs: int, 
-                         min_rpeaks: int = MIN_RPEAKS_REQUIRED,
-                         window_sec: float = 5.0, 
-                         step_sec: float = 0.25) -> Tuple[int, int, float, int]:
+    def find_best_ecg_window(ecg_data: np.ndarray, fs: int, 
+                             min_rpeaks: int = MIN_RPEAKS_REQUIRED,
+                             window_sec: float = 5.0, 
+                             step_sec: float = 0.25) -> Tuple[int, int, float, int]:
+        """Find best quality ECG window with high SNR and sufficient R-peaks"""
         window_samples = int(window_sec * fs)
         step_samples = int(step_sec * fs)
         
-        print(f"[WINDOW] Searching in {len(ecg_data)} samples ({len(ecg_data)/fs:.1f}s)")
-        print(f"[WINDOW] Window: {window_sec}s, step: {step_sec}s, min R-peaks: {min_rpeaks}")
+        print(f"[ECG-WINDOW] Searching {len(ecg_data)} samples ({len(ecg_data)/fs:.1f}s)")
         
         if len(ecg_data) < window_samples:
             snr = SignalQualityAnalyzer.calculate_snr(ecg_data, fs)
@@ -447,33 +459,7 @@ class SignalQualityAnalyzer:
             rpeak_count = SignalQualityAnalyzer.count_rpeaks_in_segment(segment, fs)
             
             if rpeak_count >= min_rpeaks:
-                rr_bonus = 0
-                if NEUROKIT_AVAILABLE and rpeak_count >= 3:
-                    try:
-                        cleaned = nk.ecg_clean(segment, sampling_rate=fs)
-                        _, rpeaks_info = nk.ecg_peaks(cleaned, sampling_rate=fs)
-                        peaks = rpeaks_info.get('ECG_R_Peaks', np.array([]))
-                        if len(peaks) >= 2:
-                            rr = np.diff(peaks) / fs * 1000
-                            rr_valid = rr[(rr > 300) & (rr < 2000)]
-                            if len(rr_valid) >= 2:
-                                cv = np.std(rr_valid) / np.mean(rr_valid)
-                                rr_bonus = (1.0 - min(1.0, cv)) * 10
-                    except Exception:
-                        pass
-                candidates.append((start, end, snr, rpeak_count, snr + rr_bonus))
-        
-        if not candidates:
-            for min_req in range(min_rpeaks - 1, 1, -1):
-                for start in range(0, len(ecg_data) - window_samples + 1, step_samples):
-                    end = start + window_samples
-                    segment = ecg_data[start:end]
-                    rpeak_count = SignalQualityAnalyzer.count_rpeaks_in_segment(segment, fs)
-                    if rpeak_count >= min_req:
-                        snr = SignalQualityAnalyzer.calculate_snr(segment, fs)
-                        candidates.append((start, end, snr, rpeak_count, snr))
-                if candidates:
-                    break
+                candidates.append((start, end, snr, rpeak_count, snr))
         
         if not candidates:
             snr = SignalQualityAnalyzer.calculate_snr(ecg_data[:window_samples], fs)
@@ -482,17 +468,18 @@ class SignalQualityAnalyzer:
         
         candidates.sort(key=lambda x: x[4], reverse=True)
         best = candidates[0]
-        print(f"[WINDOW] BEST: {best[0]/fs:.2f}s-{best[1]/fs:.2f}s, SNR: {best[2]:.1f}dB, R-peaks: {best[3]}")
+        print(f"[ECG-WINDOW] BEST: {best[0]/fs:.2f}s-{best[1]/fs:.2f}s, SNR: {best[2]:.1f}dB, R-peaks: {best[3]}")
         return best[0], best[1], best[2], best[3]
+
+
 
 
 class PPGPreprocessor:
     @staticmethod
     def preprocess(raw_signal: np.ndarray, fs: int = PPG_FS) -> Dict[str, np.ndarray]:
-        print(f"[PPG-PRE] Input: {len(raw_signal)} samples, range: {raw_signal.min():.0f}-{raw_signal.max():.0f}")
+        print(f"[PPG-PRE] Input: {len(raw_signal)} samples")
         
         signal = np.array(raw_signal, dtype=np.float64)
-        
         dc_removed = signal - np.mean(signal)
         
         try:
@@ -501,10 +488,7 @@ class PPGPreprocessor:
             detrended = dc_removed
         
         filtered = bandpass_filter(detrended, 0.5, 8.0, fs, order=3)
-        
         normalized = (filtered - np.mean(filtered)) / (np.std(filtered) + 1e-10)
-        
-        print(f"[PPG-PRE] Output range: {normalized.min():.2f} to {normalized.max():.2f}")
         
         return {
             'raw': signal,
@@ -517,14 +501,13 @@ class PPGPreprocessor:
     @staticmethod
     def find_peaks_robust(signal: np.ndarray, fs: int) -> np.ndarray:
         min_peak_distance = int(0.4 * fs)
-        max_peak_distance = int(2.0 * fs)
-        
         methods_results = []
         
+        # Method 1: Scipy inverted
         try:
             inverted = -signal
             height_threshold = np.percentile(inverted, 70)
-            peaks, props = scipy_find_peaks(
+            peaks, _ = scipy_find_peaks(
                 inverted, 
                 height=height_threshold,
                 distance=min_peak_distance,
@@ -532,81 +515,24 @@ class PPGPreprocessor:
             )
             if len(peaks) >= 3:
                 methods_results.append(('scipy_inverted', peaks, len(peaks)))
-                print(f"[PPG-PEAKS] scipy_inverted: {len(peaks)} peaks")
-        except Exception as e:
-            print(f"[PPG-PEAKS] scipy_inverted failed: {e}")
+        except Exception:
+            pass
         
-        try:
-            height_threshold = np.percentile(signal, 70)
-            peaks, props = scipy_find_peaks(
-                signal,
-                height=height_threshold,
-                distance=min_peak_distance,
-                prominence=np.std(signal) * 0.3
-            )
-            if len(peaks) >= 3:
-                methods_results.append(('scipy_direct', peaks, len(peaks)))
-                print(f"[PPG-PEAKS] scipy_direct: {len(peaks)} peaks")
-        except Exception as e:
-            print(f"[PPG-PEAKS] scipy_direct failed: {e}")
-        
+        # Method 2: NeuroKit2
         if NEUROKIT_AVAILABLE:
             try:
                 peaks_info = nk.ppg_findpeaks(signal, sampling_rate=fs)
                 peaks = np.array(peaks_info.get('PPG_Peaks', []))
                 if len(peaks) >= 3:
                     methods_results.append(('neurokit', peaks, len(peaks)))
-                    print(f"[PPG-PEAKS] neurokit: {len(peaks)} peaks")
-            except Exception as e:
-                print(f"[PPG-PEAKS] neurokit failed: {e}")
-            
-            try:
-                peaks_info = nk.ppg_findpeaks(signal, sampling_rate=fs, method='elgendi')
-                peaks = np.array(peaks_info.get('PPG_Peaks', []))
-                if len(peaks) >= 3:
-                    methods_results.append(('elgendi', peaks, len(peaks)))
-                    print(f"[PPG-PEAKS] elgendi: {len(peaks)} peaks")
-            except Exception as e:
-                print(f"[PPG-PEAKS] elgendi failed: {e}")
-        
-        try:
-            diff1 = np.diff(signal)
-            diff2 = np.diff(diff1)
-            
-            zero_crossings = []
-            for i in range(len(diff1) - 1):
-                if diff1[i] > 0 and diff1[i+1] <= 0:
-                    zero_crossings.append(i + 1)
-            
-            if len(zero_crossings) >= 3:
-                peaks = np.array(zero_crossings)
-                intervals = np.diff(peaks)
-                valid_mask = (intervals >= min_peak_distance) & (intervals <= max_peak_distance)
-                if np.sum(valid_mask) >= 2:
-                    methods_results.append(('zero_crossing', peaks, len(peaks)))
-                    print(f"[PPG-PEAKS] zero_crossing: {len(peaks)} peaks")
-        except Exception as e:
-            print(f"[PPG-PEAKS] zero_crossing failed: {e}")
+            except Exception:
+                pass
         
         if not methods_results:
-            print("[PPG-PEAKS] WARNING: No peaks found by any method")
             return np.array([])
         
         best_method = max(methods_results, key=lambda x: x[2])
-        print(f"[PPG-PEAKS] Using {best_method[0]} with {best_method[2]} peaks")
-        
-        peaks = best_method[1]
-        if len(peaks) >= 2:
-            intervals = np.diff(peaks)
-            valid_intervals = (intervals >= min_peak_distance) & (intervals <= max_peak_distance)
-            
-            filtered_peaks = [peaks[0]]
-            for i, is_valid in enumerate(valid_intervals):
-                if is_valid:
-                    filtered_peaks.append(peaks[i + 1])
-            peaks = np.array(filtered_peaks)
-        
-        return peaks
+        return best_method[1]
 
 
 class SpO2Calculator:
@@ -614,11 +540,9 @@ class SpO2Calculator:
     def calculate(red_signal: np.ndarray, ir_signal: np.ndarray, 
                   red_peaks: np.ndarray, ir_peaks: np.ndarray,
                   fs: int = PPG_FS) -> Dict[str, Any]:
-        print(f"[SPO2] Calculating from {len(red_peaks)} red peaks, {len(ir_peaks)} IR peaks")
         
         result = {
             'spo2': None,
-            'spo2_values': [],
             'r_ratios': [],
             'perfusion_index_red': None,
             'perfusion_index_ir': None,
@@ -628,7 +552,6 @@ class SpO2Calculator:
         peaks = ir_peaks if len(ir_peaks) >= len(red_peaks) else red_peaks
         
         if len(peaks) < 3:
-            print("[SPO2] Insufficient peaks for SpO2 calculation")
             return result
         
         r_ratios = []
@@ -637,9 +560,7 @@ class SpO2Calculator:
             start_idx = peaks[i]
             end_idx = peaks[i + 1]
             
-            if end_idx - start_idx < 3:
-                continue
-            if end_idx >= len(red_signal) or end_idx >= len(ir_signal):
+            if end_idx - start_idx < 3 or end_idx >= len(red_signal):
                 continue
             
             red_segment = red_signal[start_idx:end_idx]
@@ -662,14 +583,8 @@ class SpO2Calculator:
             if 0.2 < r_ratio < 2.0:
                 r_ratios.append(r_ratio)
         
-        print(f"[SPO2] Valid R-ratios: {len(r_ratios)}")
-        
         if len(r_ratios) >= 2:
-            r_ratios_sorted = sorted(r_ratios)
-            trim_count = max(1, len(r_ratios) // 4)
-            r_ratios_trimmed = r_ratios_sorted[trim_count:-trim_count] if len(r_ratios) > 4 else r_ratios_sorted
-            r_avg = np.mean(r_ratios_trimmed)
-            
+            r_avg = np.mean(r_ratios)
             result['r_ratios'] = r_ratios
             
             lookup_index = int(r_avg * 100)
@@ -680,7 +595,6 @@ class SpO2Calculator:
             
             result['spo2'] = spo2
             result['valid'] = True
-            print(f"[SPO2] R-ratio avg: {r_avg:.3f}, SpO2: {spo2}%")
         
         try:
             red_dc = np.mean(red_signal)
@@ -692,26 +606,27 @@ class SpO2Calculator:
             ir_ac = np.max(ir_signal) - np.min(ir_signal)
             if ir_dc > 0:
                 result['perfusion_index_ir'] = (ir_ac / ir_dc) * 100
-            
-            print(f"[SPO2] Perfusion Index - Red: {result['perfusion_index_red']:.2f}%, IR: {result['perfusion_index_ir']:.2f}%")
-        except Exception as e:
-            print(f"[SPO2] Perfusion index calculation failed: {e}")
+        except Exception:
+            pass
         
         return result
 
 
 class ECGProcessor:
+    """Complete ECG analysis with all NeuroKit2 features"""
     def __init__(self, fs: int = ECG_FS):
         self.fs = fs
 
-    def process(self, ecg_uv: np.ndarray) -> Dict[str, Any]:
+    def process(self, ecg_uv: np.ndarray, sample_name: str = "", long_term_analysis: bool = False) -> Dict[str, Any]:
         print(f"\n{'='*70}")
-        print(f"[ECG] ANALYSIS: {len(ecg_uv)} samples @ {self.fs} Hz ({len(ecg_uv)/self.fs:.2f}s)")
+        print(f"[ECG-{sample_name}] {len(ecg_uv)} samples @ {self.fs} Hz ({len(ecg_uv)/self.fs:.2f}s)")
         print(f"{'='*70}")
         
         ecg_signal = np.array(ecg_uv, dtype=np.float64)
         
         result = {
+            'sample_name': sample_name,
+            'duration_sec': len(ecg_uv) / self.fs,
             'raw_uv': ecg_signal,
             'raw_mv': ecg_signal / 1000.0,
             'cleaned_uv': None,
@@ -731,29 +646,30 @@ class ECGProcessor:
         if not NEUROKIT_AVAILABLE:
             result['cleaned_uv'] = ecg_signal
             result['cleaned_mv'] = ecg_signal / 1000.0
-            result['analysis_method'] = 'basic'
             return result
 
+        # Clean signal
         try:
             cleaned = nk.ecg_clean(ecg_signal, sampling_rate=self.fs, method='neurokit')
             result['cleaned_uv'] = cleaned
             result['cleaned_mv'] = cleaned / 1000.0
-            print(f"[ECG] Cleaned: {cleaned.min():.1f} to {cleaned.max():.1f} µV")
         except Exception as e:
             print(f"[ECG] Clean failed: {e}")
             cleaned = ecg_signal
             result['cleaned_uv'] = ecg_signal
             result['cleaned_mv'] = ecg_signal / 1000.0
 
+        # Find R-peaks
         try:
             _, rpeaks_info = nk.ecg_peaks(cleaned, sampling_rate=self.fs)
             r_peaks = np.array(rpeaks_info.get('ECG_R_Peaks', []))
             result['r_peaks'] = r_peaks
-            print(f"[ECG] R-peaks: {len(r_peaks)} at {r_peaks[:8]}{'...' if len(r_peaks)>8 else ''}")
+            print(f"[ECG] R-peaks: {len(r_peaks)}")
         except Exception as e:
             print(f"[ECG] Peak detection failed: {e}")
             r_peaks = np.array([])
 
+        # Heart rate
         if len(r_peaks) >= 2:
             rr_samples = np.diff(r_peaks)
             rr_ms = rr_samples / self.fs * 1000
@@ -769,8 +685,8 @@ class ECGProcessor:
                     'max': float(np.max(hr_bpm)),
                     'values': hr_bpm
                 }
-                print(f"[ECG] HR: {result['heart_rate']['mean']:.1f} ± {result['heart_rate']['std']:.1f} bpm")
 
+        # Signal quality
         try:
             signals_df, info = nk.ecg_process(cleaned, sampling_rate=self.fs)
             result['analysis_method'] = 'neurokit2_full'
@@ -778,24 +694,24 @@ class ECGProcessor:
                 quality = signals_df['ECG_Quality'].dropna().values
                 if len(quality) > 0:
                     result['quality'] = float(np.mean(quality))
-                    print(f"[ECG] Quality: {result['quality']:.3f}")
         except Exception as e:
-            print(f"[ECG] Full process failed: {e}")
+            print(f"[ECG] Process failed: {e}")
             result['analysis_method'] = 'neurokit2_partial'
 
+        # Wave delineation
         if len(r_peaks) >= 3:
             try:
                 _, waves = nk.ecg_delineate(cleaned, r_peaks, sampling_rate=self.fs, method='dwt')
                 result['waves'] = waves
                 self._calculate_intervals(result, waves, r_peaks)
-                print("[ECG] Delineation complete")
             except Exception as e:
                 print(f"[ECG] Delineation failed: {e}")
 
+        # HRV analysis
         if len(r_peaks) >= 4:
-            self._calculate_hrv(result, r_peaks)
+            self._calculate_hrv(result, r_peaks, long_term_analysis)
 
-        print(f"[ECG] Complete: {result['analysis_method']}")
+        print(f"[ECG-{sample_name}] Complete")
         return result
 
     def _calculate_intervals(self, result: Dict, waves: Dict, r_peaks: np.ndarray):
@@ -806,6 +722,7 @@ class ECGProcessor:
             s_peaks = waves.get('ECG_S_Peaks', [])
             t_offsets = waves.get('ECG_T_Offsets', [])
             
+            # PR Interval
             pr_vals = []
             for i, r in enumerate(r_peaks):
                 if i < len(p_onsets) and p_onsets[i] is not None and not np.isnan(p_onsets[i]):
@@ -815,6 +732,7 @@ class ECGProcessor:
             if pr_vals:
                 intervals['PR_Interval'] = float(np.mean(pr_vals))
             
+            # QRS Duration
             qrs_vals = []
             for i in range(len(r_peaks)):
                 if i < len(q_peaks) and i < len(s_peaks):
@@ -826,6 +744,7 @@ class ECGProcessor:
             if qrs_vals:
                 intervals['QRS_Duration'] = float(np.mean(qrs_vals))
             
+            # QT Interval
             qt_vals = []
             for i in range(len(r_peaks)):
                 if i < len(q_peaks) and i < len(t_offsets):
@@ -842,48 +761,53 @@ class ECGProcessor:
                     intervals['QTc'] = float(intervals['QT_Interval'] / np.sqrt(rr_sec))
             
             result['intervals'] = intervals
-            for k, v in intervals.items():
-                print(f"[ECG] {k}: {v:.1f}ms")
         except Exception as e:
             print(f"[ECG] Interval calc error: {e}")
 
-    def _calculate_hrv(self, result: Dict, r_peaks: np.ndarray):
-        print(f"[ECG] HRV Analysis with {len(r_peaks)} R-peaks...")
+    def _calculate_hrv(self, result: Dict, r_peaks: np.ndarray, long_term_analysis: bool = False):
+        print(f"[ECG] HRV Analysis with {len(r_peaks)} R-peaks... (Long-term: {long_term_analysis})")
         
+        # Time domain
         try:
             hrv_time = nk.hrv_time(r_peaks, sampling_rate=self.fs, show=False)
             time_metrics = ['HRV_MeanNN', 'HRV_SDNN', 'HRV_RMSSD', 'HRV_pNN50', 'HRV_pNN20',
-                          'HRV_SDSD', 'HRV_CVNN', 'HRV_MedianNN', 'HRV_MadNN']
+                          'HRV_SDSD', 'HRV_CVNN', 'HRV_MedianNN', 'HRV_MadNN', 'HRV_CVSD']
             for m in time_metrics:
                 if m in hrv_time.columns:
                     val = hrv_time[m].values[0]
                     if val is not None and not np.isnan(val) and not np.isinf(val):
                         result['hrv_time'][m] = float(val)
-            print(f"[ECG] HRV Time: {len(result['hrv_time'])} metrics")
         except Exception as e:
             print(f"[ECG] HRV Time failed: {e}")
         
-        duration_sec = len(result['raw_uv']) / self.fs
-        if duration_sec >= 60 and len(r_peaks) >= 30:
-            try:
-                hrv_freq = nk.hrv_frequency(r_peaks, sampling_rate=self.fs, show=False)
-                freq_metrics = ['HRV_VLF', 'HRV_LF', 'HRV_HF', 'HRV_LFHF', 'HRV_LFn', 'HRV_HFn', 'HRV_TP']
-                for m in freq_metrics:
-                    if m in hrv_freq.columns:
-                        val = hrv_freq[m].values[0]
-                        if val is not None and not np.isnan(val) and not np.isinf(val) and val > 0:
-                            result['hrv_freq'][m] = float(val)
-                print(f"[ECG] HRV Freq: {len(result['hrv_freq'])} metrics")
-            except Exception as e:
-                print(f"[ECG] HRV Freq failed: {e}")
+        # Frequency domain - ONLY for long-term analysis (Sample 2)
+        if long_term_analysis:
+            duration_sec = len(result['raw_uv']) / self.fs
+            if duration_sec >= 60 and len(r_peaks) >= 30:
+                try:
+                    hrv_freq = nk.hrv_frequency(r_peaks, sampling_rate=self.fs, show=False)
+                    freq_metrics = ['HRV_VLF', 'HRV_LF', 'HRV_HF', 'HRV_LFHF', 'HRV_LFn', 'HRV_HFn', 
+                                   'HRV_TP', 'HRV_LnHF']
+                    for m in freq_metrics:
+                        if m in hrv_freq.columns:
+                            val = hrv_freq[m].values[0]
+                            if val is not None and not np.isnan(val) and not np.isinf(val) and val > 0:
+                                result['hrv_freq'][m] = float(val)
+                    print(f"[ECG] HRV Freq: {len(result['hrv_freq'])} metrics")
+                except Exception as e:
+                    print(f"[ECG] HRV Freq failed: {e}")
+            else:
+                print(f"[ECG] HRV Freq skipped: need 60s+ ({duration_sec:.0f}s available)")
         else:
-            print(f"[ECG] HRV Freq skipped: need 60s+ recording ({duration_sec:.0f}s available)")
+            print(f"[ECG] HRV Freq skipped: Short-term analysis only (Sample 1)")
         
-        if len(r_peaks) >= 10:
+        # Nonlinear - ONLY for long-term analysis (Sample 2)
+        if long_term_analysis and len(r_peaks) >= 10:
             try:
                 hrv_nl = nk.hrv_nonlinear(r_peaks, sampling_rate=self.fs, show=False)
                 nl_metrics = ['HRV_SD1', 'HRV_SD2', 'HRV_SD1SD2', 'HRV_ApEn', 'HRV_SampEn', 
-                             'HRV_DFA_alpha1', 'HRV_DFA_alpha2']
+                             'HRV_DFA_alpha1', 'HRV_DFA_alpha2', 'HRV_MFDFA_alpha1_Width',
+                             'HRV_MSE']
                 for m in nl_metrics:
                     if m in hrv_nl.columns:
                         val = hrv_nl[m].values[0]
@@ -893,21 +817,25 @@ class ECGProcessor:
             except Exception as e:
                 print(f"[ECG] HRV Nonlinear failed: {e}")
         else:
-            print(f"[ECG] HRV Nonlinear skipped: need 10+ R-peaks ({len(r_peaks)} available)")
+            if not long_term_analysis:
+                print(f"[ECG] HRV Nonlinear skipped: Short-term analysis only (Sample 1)")
+            else:
+                print(f"[ECG] HRV Nonlinear skipped: need 10+ R-peaks ({len(r_peaks)} available)")
 
 
 class PPGProcessor:
+    """Complete PPG analysis with all NeuroKit2 features"""
     def __init__(self, fs: int = PPG_FS):
         self.fs = fs
 
-    def process(self, red_data: np.ndarray, ir_data: np.ndarray) -> Dict[str, Any]:
+    def process(self, red_data: np.ndarray, ir_data: np.ndarray, sample_name: str = "", long_term_analysis: bool = False) -> Dict[str, Any]:
         print(f"\n{'='*70}")
-        print(f"[PPG] ANALYSIS: {len(ir_data)} samples @ {self.fs} Hz ({len(ir_data)/self.fs:.2f}s)")
-        print(f"[PPG] Red range: {red_data.min():.0f}-{red_data.max():.0f}")
-        print(f"[PPG] IR range: {ir_data.min():.0f}-{ir_data.max():.0f}")
+        print(f"[PPG-{sample_name}] {len(ir_data)} samples @ {self.fs} Hz ({len(ir_data)/self.fs:.2f}s)")
         print(f"{'='*70}")
         
         result = {
+            'sample_name': sample_name,
+            'duration_sec': len(ir_data) / self.fs,
             'red_raw': red_data,
             'ir_raw': ir_data,
             'red_processed': None,
@@ -926,26 +854,25 @@ class PPGProcessor:
             'analysis_method': 'none',
         }
         
-        print("[PPG] Preprocessing IR signal...")
+        # Preprocess both channels
         ir_prep = PPGPreprocessor.preprocess(ir_data, self.fs)
         result['ir_processed'] = ir_prep
         
-        print("[PPG] Preprocessing Red signal...")
         red_prep = PPGPreprocessor.preprocess(red_data, self.fs)
         result['red_processed'] = red_prep
         
-        print("[PPG] Finding peaks in IR signal...")
+        # Find peaks
         ir_peaks = PPGPreprocessor.find_peaks_robust(ir_prep['normalized'], self.fs)
         result['ir_peaks'] = ir_peaks
         
-        print("[PPG] Finding peaks in Red signal...")
         red_peaks = PPGPreprocessor.find_peaks_robust(red_prep['normalized'], self.fs)
         result['red_peaks'] = red_peaks
         
-        print(f"[PPG] Peaks found - IR: {len(ir_peaks)}, Red: {len(red_peaks)}")
+        print(f"[PPG] Peaks - IR: {len(ir_peaks)}, Red: {len(red_peaks)}")
         
         peaks = ir_peaks if len(ir_peaks) >= len(red_peaks) else red_peaks
         
+        # Heart rate from peaks
         if len(peaks) >= 2:
             pp_samples = np.diff(peaks)
             pp_ms = pp_samples / self.fs * 1000
@@ -961,40 +888,40 @@ class PPGProcessor:
                     'max': float(np.max(hr_bpm)),
                     'values': hr_bpm
                 }
-                print(f"[PPG] HR: {result['heart_rate']['mean']:.1f} ± {result['heart_rate']['std']:.1f} bpm")
                 result['analysis_method'] = 'custom_preprocessing'
         
+        # SpO2 calculation
         if len(ir_peaks) >= 3 and len(red_peaks) >= 3:
-            print("[PPG] Calculating SpO2...")
-            spo2_result = SpO2Calculator.calculate(
-                red_data, ir_data, red_peaks, ir_peaks, self.fs
-            )
+            spo2_result = SpO2Calculator.calculate(red_data, ir_data, red_peaks, ir_peaks, self.fs)
             result['spo2_data'] = spo2_result
             if spo2_result['valid']:
                 result['spo2'] = spo2_result['spo2']
                 result['perfusion_index'] = spo2_result.get('perfusion_index_ir')
         
+        # PRV analysis (Pulse Rate Variability)
         if len(peaks) >= 5:
-            self._calculate_prv(result, peaks)
+            self._calculate_prv(result, peaks, long_term_analysis)
         
+        # Signal quality
         ac = np.std(ir_prep['filtered'])
         dc = np.mean(ir_data)
         if dc > 0:
             result['signal_quality'] = min(1.0, ac / (dc * 0.01))
-            print(f"[PPG] Signal quality: {result['signal_quality']:.3f}")
         
-        print(f"[PPG] Complete: {result['analysis_method']}")
+        print(f"[PPG-{sample_name}] Complete")
         return result
 
-    def _calculate_prv(self, result: Dict, peaks: np.ndarray):
-        print(f"[PPG] PRV Analysis with {len(peaks)} peaks...")
+    def _calculate_prv(self, result: Dict, peaks: np.ndarray, long_term_analysis: bool = False):
+        print(f"[PPG] PRV Analysis with {len(peaks)} peaks... (Long-term: {long_term_analysis})")
         
         if not NEUROKIT_AVAILABLE:
             return
         
+        # Time domain PRV - always calculated
         try:
             prv_time = nk.hrv_time(peaks, sampling_rate=self.fs, show=False)
-            time_metrics = ['HRV_MeanNN', 'HRV_SDNN', 'HRV_RMSSD', 'HRV_pNN50', 'HRV_pNN20']
+            time_metrics = ['HRV_MeanNN', 'HRV_SDNN', 'HRV_RMSSD', 'HRV_pNN50', 'HRV_pNN20',
+                          'HRV_SDSD', 'HRV_MedianNN']
             for m in time_metrics:
                 if m in prv_time.columns:
                     val = prv_time[m].values[0]
@@ -1004,10 +931,31 @@ class PPGProcessor:
         except Exception as e:
             print(f"[PPG] PRV Time failed: {e}")
         
-        if len(peaks) >= 10:
+        # Frequency domain PRV - ONLY for long-term analysis (Sample 2)
+        if long_term_analysis:
+            duration_sec = len(result['ir_raw']) / self.fs
+            if duration_sec >= 60 and len(peaks) >= 30:
+                try:
+                    prv_freq = nk.hrv_frequency(peaks, sampling_rate=self.fs, show=False)
+                    freq_metrics = ['HRV_VLF', 'HRV_LF', 'HRV_HF', 'HRV_LFHF', 'HRV_LFn', 'HRV_HFn']
+                    for m in freq_metrics:
+                        if m in prv_freq.columns:
+                            val = prv_freq[m].values[0]
+                            if val is not None and not np.isnan(val) and not np.isinf(val) and val > 0:
+                                result['prv_freq'][m.replace('HRV', 'PRV')] = float(val)
+                    print(f"[PPG] PRV Freq: {len(result['prv_freq'])} metrics")
+                except Exception as e:
+                    print(f"[PPG] PRV Freq failed: {e}")
+            else:
+                print(f"[PPG] PRV Freq skipped: need 60s+ ({duration_sec:.0f}s available)")
+        else:
+            print(f"[PPG] PRV Freq skipped: Short-term analysis only (Sample 1)")
+        
+        # Nonlinear PRV - ONLY for long-term analysis (Sample 2)
+        if long_term_analysis and len(peaks) >= 10:
             try:
                 prv_nl = nk.hrv_nonlinear(peaks, sampling_rate=self.fs, show=False)
-                nl_metrics = ['HRV_SD1', 'HRV_SD2', 'HRV_SD1SD2']
+                nl_metrics = ['HRV_SD1', 'HRV_SD2', 'HRV_SD1SD2', 'HRV_ApEn', 'HRV_SampEn']
                 for m in nl_metrics:
                     if m in prv_nl.columns:
                         val = prv_nl[m].values[0]
@@ -1016,9 +964,15 @@ class PPGProcessor:
                 print(f"[PPG] PRV Nonlinear: {len(result['prv_nonlinear'])} metrics")
             except Exception as e:
                 print(f"[PPG] PRV Nonlinear failed: {e}")
+        else:
+            if not long_term_analysis:
+                print(f"[PPG] PRV Nonlinear skipped: Short-term analysis only (Sample 1)")
+            else:
+                print(f"[PPG] PRV Nonlinear skipped: need 10+ peaks ({len(peaks)} available)")
 
 
 class ReportGenerator(QThread):
+    """Enhanced report with dual-sample analysis"""
     finished = pyqtSignal(bool, str)
     progress = pyqtSignal(str)
 
@@ -1048,25 +1002,45 @@ class ReportGenerator(QThread):
                 self.finished.emit(False, "Insufficient ECG data (need 3+ seconds)")
                 return
 
-            self.progress.emit("Finding best ECG window...")
-            start_idx, end_idx, snr, rpeak_count = SignalQualityAnalyzer.find_best_window(
+            # ============== ECG ANALYSIS ==============
+            self.progress.emit("Analyzing ECG Sample 1 (Best Quality)...")
+            
+            # Sample 1: Best quality short segment - BASIC ANALYSIS ONLY
+            start1, end1, snr1, rpeak_cnt1 = SignalQualityAnalyzer.find_best_ecg_window(
                 self.ecg_data, ECG_FS, min_rpeaks=MIN_RPEAKS_REQUIRED
             )
-            ecg_window = self.ecg_data[start_idx:end_idx]
-            
-            self.progress.emit("Analyzing ECG...")
+            ecg_sample1 = self.ecg_data[start1:end1]
             ecg_processor = ECGProcessor(ECG_FS)
-            ecg_result = ecg_processor.process(ecg_window)
-
-            ppg_result = None
+            ecg_result1 = ecg_processor.process(ecg_sample1, "Sample1", long_term_analysis=False)
+            
+            # Sample 2: Full recording - COMPLETE LONG-TERM ANALYSIS
+            ecg_result2 = None
+            total_duration = len(self.ecg_data) / ECG_FS
+            if total_duration >= MIN_DURATION_FOR_SAMPLE2:
+                self.progress.emit("Analyzing ECG Sample 2 (Full Recording - Long-term)...")
+                ecg_result2 = ecg_processor.process(self.ecg_data, "Sample2", long_term_analysis=True)
+            
+            # ============== PPG ANALYSIS ==============
+            ppg_result1 = None
+            ppg_result2 = None
+            
             if self.ppg_ir_data is not None and self.ppg_red_data is not None:
-                if len(self.ppg_ir_data) > PPG_FS * 5:
-                    self.progress.emit("Analyzing PPG...")
+                ppg_total_duration = len(self.ppg_ir_data) / PPG_FS
+                
+                # Sample 1: FULL PPG RECORDING - BASIC ANALYSIS ONLY (no window selection)
+                if ppg_total_duration >= 5:
+                    self.progress.emit("Analyzing PPG Sample 1 (Full Recording - Basic)...")
                     ppg_processor = PPGProcessor(PPG_FS)
-                    ppg_result = ppg_processor.process(self.ppg_red_data, self.ppg_ir_data)
+                    ppg_result1 = ppg_processor.process(self.ppg_red_data, self.ppg_ir_data, "Sample1", long_term_analysis=False)
+                    
+                    # Sample 2: Full recording - COMPLETE LONG-TERM ANALYSIS (same data, different analysis depth)
+                    if ppg_total_duration >= MIN_DURATION_FOR_SAMPLE2:
+                        self.progress.emit("Analyzing PPG Sample 2 (Full Recording - Long-term)...")
+                        ppg_result2 = ppg_processor.process(self.ppg_red_data, self.ppg_ir_data, "Sample2", long_term_analysis=True)
 
             self.progress.emit("Generating PDF report...")
-            self._create_pdf(ecg_result, ppg_result, start_idx, end_idx, snr, rpeak_count)
+            self._create_pdf(ecg_result1, ecg_result2, ppg_result1, ppg_result2,
+                           start1, end1, snr1, rpeak_cnt1)
             
             self.finished.emit(True, self.output_path)
 
@@ -1080,13 +1054,10 @@ class ReportGenerator(QThread):
             filepath = os.path.join(self.session_dir, filename)
             if filename.endswith('_ecg.csv'):
                 self.ecg_data = self._parse_waveform(filepath)
-                print(f"[LOAD] ECG: {len(self.ecg_data) if self.ecg_data is not None else 0}")
             elif filename.endswith('_ppg_red.csv'):
                 self.ppg_red_data = self._parse_waveform(filepath)
-                print(f"[LOAD] PPG Red: {len(self.ppg_red_data) if self.ppg_red_data is not None else 0}")
             elif filename.endswith('_ppg_ir.csv'):
                 self.ppg_ir_data = self._parse_waveform(filepath)
-                print(f"[LOAD] PPG IR: {len(self.ppg_ir_data) if self.ppg_ir_data is not None else 0}")
             elif filename.endswith('_vitals.csv'):
                 try:
                     self.vitals_data = pd.read_csv(filepath)
@@ -1133,33 +1104,54 @@ class ReportGenerator(QThread):
             ax.axhline(y, color='#ffaaaa', lw=0.5, zorder=0)
         ax.axhline(0, color='#ff8888', lw=0.8, zorder=0)
 
-    def _create_pdf(self, ecg_result, ppg_result, start_idx, end_idx, snr, rpeak_count):
+    def _create_pdf(self, ecg_s1, ecg_s2, ppg_s1, ppg_s2, start_idx, end_idx, snr, rpeak_count):
         plt = self.plt
         with self.PdfPages(self.output_path) as pdf:
-            self._page_cover(pdf, plt, snr, rpeak_count, ecg_result, ppg_result, start_idx, end_idx)
-            self._page_ecg_signal(pdf, plt, ecg_result, start_idx, end_idx)
+            # Cover page
+            self._page_cover(pdf, plt, ecg_s1, ecg_s2, ppg_s1, ppg_s2)
             
-            if len(ecg_result.get('r_peaks', [])) >= 3:
-                self._page_ecg_morphology(pdf, plt, ecg_result)
+            # ECG Sample 1
+            self._page_ecg_signal(pdf, plt, ecg_s1, "Sample 1: Best Quality", start_idx, end_idx, snr)
+            if len(ecg_s1.get('r_peaks', [])) >= 3:
+                self._page_ecg_morphology(pdf, plt, ecg_s1)
+            if ecg_s1.get('hrv_time'):
+                self._page_hrv(pdf, plt, ecg_s1)
             
-            if ecg_result.get('hrv_time'):
-                self._page_hrv(pdf, plt, ecg_result)
+            # ECG Sample 2
+            if ecg_s2:
+                self._page_ecg_signal(pdf, plt, ecg_s2, "Sample 2: Full Recording", 0, len(self.ecg_data), 0)
+                if len(ecg_s2.get('r_peaks', [])) >= 3:
+                    self._page_ecg_morphology(pdf, plt, ecg_s2)
+                if ecg_s2.get('hrv_time'):
+                    self._page_hrv(pdf, plt, ecg_s2)
+                # Comparison
+                self._page_ecg_comparison(pdf, plt, ecg_s1, ecg_s2)
             
-            if ppg_result:
-                self._page_ppg_signal(pdf, plt, ppg_result)
-                self._page_ppg_analysis(pdf, plt, ppg_result)
+            # PPG Sample 1
+            if ppg_s1:
+                self._page_ppg_signal(pdf, plt, ppg_s1)
+                self._page_ppg_beat_segmentation(pdf, plt, ppg_s1)
+                self._page_ppg_analysis(pdf, plt, ppg_s1)
             
-            self._page_full_recording(pdf, plt, start_idx, end_idx)
-            self._page_summary(pdf, plt, ecg_result, ppg_result, snr)
-            self._page_explanations(pdf, plt, ecg_result, ppg_result)
+            # PPG Sample 2
+            if ppg_s2:
+                self._page_ppg_signal(pdf, plt, ppg_s2)
+                self._page_ppg_beat_segmentation(pdf, plt, ppg_s2)
+                self._page_ppg_analysis(pdf, plt, ppg_s2)
+                # Comparison
+                self._page_ppg_comparison(pdf, plt, ppg_s1, ppg_s2)
+            
+            # Summary & explanations
+            self._page_summary(pdf, plt, ecg_s1, ecg_s2, ppg_s1, ppg_s2)
+            self._page_explanations(pdf, plt, ecg_s1, ppg_s1)
 
-    def _page_cover(self, pdf, plt, snr, rpeak_count, ecg_result, ppg_result, start_idx, end_idx):
+    def _page_cover(self, pdf, plt, ecg_s1, ecg_s2, ppg_s1, ppg_s2):
         fig = plt.figure(figsize=(11, 8.5))
-        fig.suptitle('NirogScan Health Report', fontsize=24, fontweight='bold', y=0.95)
+        fig.suptitle('NirogScan Health Report - Dual Sample Analysis', fontsize=20, fontweight='bold', y=0.95)
         ax = fig.add_subplot(111)
         ax.axis('off')
 
-        y = 0.85
+        y = 0.88
         ax.text(0.5, y, 'Patient Information', fontsize=14, fontweight='bold', ha='center', transform=ax.transAxes)
         y -= 0.04
         for key, value in self.patient_info.items():
@@ -1168,29 +1160,21 @@ class ReportGenerator(QThread):
             y -= 0.025
 
         y -= 0.02
-        ax.text(0.5, y, 'Recording Summary', fontsize=14, fontweight='bold', ha='center', transform=ax.transAxes)
+        ax.text(0.5, y, 'Analysis Summary', fontsize=14, fontweight='bold', ha='center', transform=ax.transAxes)
         y -= 0.04
 
         items = [
-            ('ECG Duration', f'{len(self.ecg_data)/ECG_FS:.1f}s'),
-            ('ECG Sample Rate', f'{ECG_FS} Hz'),
-            ('Analysis Window', f'{start_idx/ECG_FS:.2f}s - {end_idx/ECG_FS:.2f}s'),
-            ('Window SNR', f'{snr:.1f} dB'),
-            ('R-peaks Found', f'{rpeak_count}'),
+            ('Total ECG Duration', f'{len(self.ecg_data)/ECG_FS:.1f}s'),
+            ('ECG Sample 1', f'{ecg_s1["duration_sec"]:.1f}s (Best 5s Window - Basic Analysis)'),
         ]
-
-        hr = ecg_result.get('heart_rate')
-        if hr:
-            items.append(('ECG Heart Rate', f'{hr["mean"]:.1f} ± {hr["std"]:.1f} bpm'))
-
-        if ppg_result:
-            items.append(('PPG Duration', f'{len(self.ppg_ir_data)/PPG_FS:.1f}s'))
-            if ppg_result.get('heart_rate'):
-                items.append(('PPG Pulse Rate', f'{ppg_result["heart_rate"]["mean"]:.1f} ± {ppg_result["heart_rate"]["std"]:.1f} bpm'))
-            if ppg_result.get('spo2'):
-                items.append(('SpO2', f'{ppg_result["spo2"]}%'))
-            if ppg_result.get('perfusion_index'):
-                items.append(('Perfusion Index', f'{ppg_result["perfusion_index"]:.2f}%'))
+        if ecg_s2:
+            items.append(('ECG Sample 2', f'{ecg_s2["duration_sec"]:.1f}s (Full Recording - Complete Analysis)'))
+        
+        if ppg_s1:
+            items.append(('Total PPG Duration', f'{ppg_s1["duration_sec"]:.1f}s'))
+            items.append(('PPG Sample 1', 'Same as above (Basic Analysis)'))
+        if ppg_s2:
+            items.append(('PPG Sample 2', 'Same as above (Complete Long-term Analysis)'))
 
         for label, value in items:
             ax.text(0.3, y, f'{label}:', ha='right', fontsize=10, transform=ax.transAxes)
@@ -1204,9 +1188,9 @@ class ReportGenerator(QThread):
         pdf.savefig(fig, bbox_inches='tight')
         plt.close(fig)
 
-    def _page_ecg_signal(self, pdf, plt, ecg_result, start_idx, end_idx):
+    def _page_ecg_signal(self, pdf, plt, ecg_result, title, start_idx, end_idx, snr):
         fig, axes = plt.subplots(2, 1, figsize=(11, 8.5))
-        fig.suptitle('ECG Signal Analysis', fontsize=14, fontweight='bold')
+        fig.suptitle(f'ECG - {title}', fontsize=14, fontweight='bold')
 
         raw_mv = ecg_result['raw_mv']
         clean_mv = ecg_result['cleaned_mv']
@@ -1220,15 +1204,18 @@ class ReportGenerator(QThread):
         if len(r_peaks) > 0:
             valid_peaks = r_peaks[r_peaks < len(raw_mv)]
             ax.scatter(valid_peaks/ECG_FS, raw_mv[valid_peaks], color='red', s=80, marker='v', zorder=10)
+            # Add R-R interval timing annotations
             for i in range(len(valid_peaks) - 1):
-                rr_ms = (valid_peaks[i+1] - valid_peaks[i]) / ECG_FS * 1000
-                mid_t = (valid_peaks[i] + valid_peaks[i+1]) / 2 / ECG_FS
-                ax.annotate(f'{rr_ms:.0f}ms', xy=(mid_t, -1.7), fontsize=7, ha='center',
-                           bbox=dict(boxstyle='round,pad=0.15', fc='yellow', ec='orange', alpha=0.9))
+                if i < 10:  # Limit annotations to avoid clutter
+                    rr_ms = (valid_peaks[i+1] - valid_peaks[i]) / ECG_FS * 1000
+                    mid_t = (valid_peaks[i] + valid_peaks[i+1]) / 2 / ECG_FS
+                    mid_y = np.mean([raw_mv[valid_peaks[i]], raw_mv[valid_peaks[i+1]]])
+                    ax.annotate(f'{rr_ms:.0f}ms', xy=(mid_t, mid_y - 0.3), fontsize=7, ha='center',
+                               bbox=dict(boxstyle='round,pad=0.2', fc='yellow', ec='orange', alpha=0.8))
         ax.set_xlim(0, duration)
         ax.set_ylim(-2.0, 2.0)
         ax.set_ylabel('mV')
-        ax.set_title(f'Raw ECG - Window: {start_idx/ECG_FS:.2f}s-{end_idx/ECG_FS:.2f}s')
+        ax.set_title(f'Raw ECG - {ecg_result["sample_name"]} - R-R Intervals Shown')
 
         ax = axes[1]
         self._draw_ecg_grid(ax, duration)
@@ -1236,30 +1223,106 @@ class ReportGenerator(QThread):
         if len(r_peaks) > 0:
             valid_peaks = r_peaks[r_peaks < len(clean_mv)]
             ax.scatter(valid_peaks/ECG_FS, clean_mv[valid_peaks], color='red', s=80, marker='v', zorder=10)
+            # Add R-R interval timing on cleaned signal too
+            for i in range(len(valid_peaks) - 1):
+                if i < 10:  # Limit annotations
+                    rr_ms = (valid_peaks[i+1] - valid_peaks[i]) / ECG_FS * 1000
+                    mid_t = (valid_peaks[i] + valid_peaks[i+1]) / 2 / ECG_FS
+                    ax.plot([valid_peaks[i]/ECG_FS, valid_peaks[i+1]/ECG_FS], 
+                           [1.5, 1.5], 'g-', lw=2, alpha=0.6, zorder=8)
+                    ax.text(mid_t, 1.6, f'{rr_ms:.0f}ms', fontsize=8, ha='center',
+                           bbox=dict(boxstyle='round,pad=0.15', fc='lightgreen', alpha=0.9))
         hr = ecg_result.get('heart_rate')
         if hr:
-            ax.text(0.98, 0.95, f"HR: {hr['mean']:.1f}±{hr['std']:.1f} bpm",
+            rr_info = f"HR: {hr['mean']:.1f}±{hr['std']:.1f} bpm\nR-peaks: {len(r_peaks)}"
+            rr_intervals = ecg_result.get('rr_intervals_ms', np.array([]))
+            if len(rr_intervals) > 0:
+                rr_info += f"\nRR: {np.mean(rr_intervals):.0f}±{np.std(rr_intervals):.0f}ms"
+            ax.text(0.98, 0.95, rr_info,
                    transform=ax.transAxes, fontsize=10, ha='right', va='top',
                    bbox=dict(boxstyle='round', fc='lightgreen', alpha=0.9))
         ax.set_xlim(0, duration)
         ax.set_ylim(-2.0, 2.0)
         ax.set_ylabel('mV')
         ax.set_xlabel('Time (s)')
-        ax.set_title('Cleaned ECG (NeuroKit2)')
+        ax.set_title('Cleaned ECG')
 
         plt.tight_layout()
         pdf.savefig(fig, bbox_inches='tight')
         plt.close(fig)
+        
+        # If this is a long recording (Sample 2), create an extra-wide scrollable view
+        if duration > 20 and "Sample2" in title:
+            self._page_ecg_signal_wide(pdf, plt, ecg_result, title)
+    
+    def _page_ecg_signal_wide(self, pdf, plt, ecg_result, title):
+        """Create extra-wide landscape page for full ECG signal visualization"""
+        raw_mv = ecg_result['raw_mv']
+        clean_mv = ecg_result['cleaned_mv']
+        r_peaks = ecg_result.get('r_peaks', np.array([]))
+        duration = len(raw_mv) / ECG_FS
+        t = np.arange(len(raw_mv)) / ECG_FS
+        
+        # Calculate width based on duration: 1 inch per 2 seconds
+        fig_width = max(20, duration / 2)
+        fig_width = min(fig_width, 200)  # Cap at 200 inches
+        
+        fig, axes = plt.subplots(2, 1, figsize=(fig_width, 11))
+        fig.suptitle(f'ECG - {title} - FULL SCROLLABLE VIEW', fontsize=16, fontweight='bold')
+        
+        # Raw ECG
+        ax = axes[0]
+        self._draw_ecg_grid(ax, duration)
+        ax.plot(t, raw_mv, 'k-', lw=1.0, zorder=5)
+        if len(r_peaks) > 0:
+            valid_peaks = r_peaks[r_peaks < len(raw_mv)]
+            ax.scatter(valid_peaks/ECG_FS, raw_mv[valid_peaks], color='red', s=100, marker='v', zorder=10)
+            # Add ALL R-R intervals on wide view
+            for i in range(len(valid_peaks) - 1):
+                rr_ms = (valid_peaks[i+1] - valid_peaks[i]) / ECG_FS * 1000
+                mid_t = (valid_peaks[i] + valid_peaks[i+1]) / 2 / ECG_FS
+                ax.text(mid_t, 1.7, f'{rr_ms:.0f}', fontsize=7, ha='center',
+                       bbox=dict(boxstyle='round,pad=0.15', fc='yellow', alpha=0.7))
+        ax.set_xlim(0, duration)
+        ax.set_ylim(-2.0, 2.0)
+        ax.set_ylabel('mV', fontsize=12, fontweight='bold')
+        ax.set_title('Raw ECG - All R-R Intervals Shown (ms)', fontsize=12)
+        ax.grid(True, which='both', alpha=0.3)
+        
+        # Cleaned ECG
+        ax = axes[1]
+        self._draw_ecg_grid(ax, duration)
+        ax.plot(t, clean_mv, 'b-', lw=1.0, zorder=5)
+        if len(r_peaks) > 0:
+            valid_peaks = r_peaks[r_peaks < len(clean_mv)]
+            ax.scatter(valid_peaks/ECG_FS, clean_mv[valid_peaks], color='red', s=100, marker='v', zorder=10)
+            # Draw lines between R-peaks
+            for i in range(len(valid_peaks) - 1):
+                ax.plot([valid_peaks[i]/ECG_FS, valid_peaks[i+1]/ECG_FS], 
+                       [1.5, 1.5], 'g-', lw=2, alpha=0.5, zorder=8)
+        ax.set_xlim(0, duration)
+        ax.set_ylim(-2.0, 2.0)
+        ax.set_ylabel('mV', fontsize=12, fontweight='bold')
+        ax.set_xlabel('Time (s)', fontsize=12, fontweight='bold')
+        ax.set_title('Cleaned ECG', fontsize=12)
+        ax.grid(True, which='both', alpha=0.3)
+        
+        plt.tight_layout()
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close(fig)
+        print(f"[PDF] Created wide ECG page: {fig_width:.1f} inches x 11 inches")
+
 
     def _page_ecg_morphology(self, pdf, plt, ecg_result):
+        # [Same as before - showing single beat, average beat, RR tachogram, Poincaré]
         fig, axes = plt.subplots(2, 2, figsize=(11, 8.5))
-        fig.suptitle('ECG Morphology & Intervals', fontsize=14, fontweight='bold')
+        fig.suptitle(f'ECG Morphology - {ecg_result["sample_name"]}', fontsize=14, fontweight='bold')
 
         clean_mv = ecg_result['cleaned_mv']
         r_peaks = ecg_result.get('r_peaks', np.array([]))
         waves = ecg_result.get('waves', {})
-        intervals = ecg_result.get('intervals', {})
 
+        # Single beat
         ax = axes[0, 0]
         if len(r_peaks) >= 2:
             idx = len(r_peaks) // 2
@@ -1270,36 +1333,14 @@ class ReportGenerator(QThread):
             t_beat = (np.arange(len(beat)) - (r - start)) / ECG_FS * 1000
             ax.plot(t_beat, beat, 'b-', lw=2)
             ax.axvline(0, color='red', linestyle='--', lw=1.5, alpha=0.7)
-            
-            markers = {'ECG_P_Peaks': ('P', 'green'), 'ECG_Q_Peaks': ('Q', 'orange'),
-                      'ECG_S_Peaks': ('S', 'purple'), 'ECG_T_Peaks': ('T', 'brown')}
-            for wkey, (label, color) in markers.items():
-                if wkey in waves and waves[wkey] is not None:
-                    arr = np.array(waves[wkey])
-                    if idx < len(arr) and not np.isnan(arr[idx]):
-                        w_idx = int(arr[idx])
-                        if start <= w_idx < end:
-                            w_t = (w_idx - r) / ECG_FS * 1000
-                            ax.scatter([w_t], [clean_mv[w_idx]], c=color, s=100, zorder=10)
-                            ax.annotate(label, (w_t, clean_mv[w_idx]), xytext=(0, 12),
-                                       textcoords='offset points', ha='center', fontsize=10,
-                                       fontweight='bold', color=color)
-            
-            info = ""
-            for k in ['PR_Interval', 'QRS_Duration', 'QT_Interval', 'QTc']:
-                if k in intervals:
-                    info += f"{k.replace('_', ' ')}: {intervals[k]:.0f}ms\n"
-            if info:
-                ax.text(0.02, 0.98, info.strip(), transform=ax.transAxes, fontsize=9, va='top',
-                       bbox=dict(boxstyle='round', fc='lightyellow', alpha=0.9))
             ax.set_xlabel('Time (ms)')
             ax.set_ylabel('mV')
-            ax.set_title('Single Beat with PQRST')
+            ax.set_title('Single Beat')
             ax.grid(True, alpha=0.3)
         else:
-            ax.text(0.5, 0.5, 'Insufficient data', ha='center', va='center', transform=ax.transAxes)
             ax.axis('off')
 
+        # Average beat
         ax = axes[0, 1]
         if len(r_peaks) >= 5:
             beats = []
@@ -1320,47 +1361,33 @@ class ReportGenerator(QThread):
                 ax.set_ylabel('mV')
                 ax.set_title(f'Average Beat (n={len(beats)})')
                 ax.grid(True, alpha=0.3)
-            else:
-                ax.text(0.5, 0.5, 'Not enough beats', ha='center', va='center', transform=ax.transAxes)
-                ax.axis('off')
         else:
-            ax.text(0.5, 0.5, 'Insufficient R-peaks', ha='center', va='center', transform=ax.transAxes)
             ax.axis('off')
 
+        # RR tachogram
         ax = axes[1, 0]
         rr_ms = ecg_result.get('rr_intervals_ms', np.array([]))
         if len(rr_ms) >= 2:
             ax.plot(rr_ms, 'b-o', markersize=6, lw=1.5)
-            ax.axhline(np.mean(rr_ms), color='red', linestyle='--', lw=2, label=f'Mean: {np.mean(rr_ms):.0f}ms')
-            ax.fill_between(range(len(rr_ms)), np.mean(rr_ms)-np.std(rr_ms), np.mean(rr_ms)+np.std(rr_ms),
-                           alpha=0.2, color='red')
+            ax.axhline(np.mean(rr_ms), color='red', linestyle='--', lw=2)
             ax.set_xlabel('Beat #')
             ax.set_ylabel('RR (ms)')
             ax.set_title('RR Tachogram')
-            ax.legend(fontsize=8)
             ax.grid(True, alpha=0.3)
         else:
-            ax.text(0.5, 0.5, 'Insufficient RR data', ha='center', va='center', transform=ax.transAxes)
             ax.axis('off')
 
+        # Poincaré plot
         ax = axes[1, 1]
         if len(rr_ms) >= 3:
             rr1, rr2 = rr_ms[:-1], rr_ms[1:]
-            ax.scatter(rr1, rr2, alpha=0.7, s=50, c='blue', edgecolors='darkblue')
-            min_v, max_v = min(rr1.min(), rr2.min())*0.95, max(rr1.max(), rr2.max())*1.05
-            ax.plot([min_v, max_v], [min_v, max_v], 'r--', alpha=0.5)
-            sd1 = ecg_result.get('hrv_nonlinear', {}).get('HRV_SD1', np.std(rr2-rr1)/np.sqrt(2))
-            sd2 = ecg_result.get('hrv_nonlinear', {}).get('HRV_SD2', np.std(rr2+rr1)/np.sqrt(2))
-            ax.text(0.05, 0.95, f'SD1: {sd1:.1f}ms\nSD2: {sd2:.1f}ms',
-                   transform=ax.transAxes, fontsize=10, va='top',
-                   bbox=dict(boxstyle='round', fc='lightyellow', alpha=0.9))
+            ax.scatter(rr1, rr2, alpha=0.7, s=50, c='blue')
             ax.set_xlabel('RR(n) ms')
             ax.set_ylabel('RR(n+1) ms')
             ax.set_title('Poincaré Plot')
             ax.grid(True, alpha=0.3)
             ax.set_aspect('equal', adjustable='box')
         else:
-            ax.text(0.5, 0.5, 'Insufficient data', ha='center', va='center', transform=ax.transAxes)
             ax.axis('off')
 
         plt.tight_layout()
@@ -1368,31 +1395,34 @@ class ReportGenerator(QThread):
         plt.close(fig)
 
     def _page_hrv(self, pdf, plt, ecg_result):
+        # [Same as before - time domain, frequency domain, nonlinear]
         hrv_time = ecg_result.get('hrv_time', {})
         hrv_freq = ecg_result.get('hrv_freq', {})
         hrv_nl = ecg_result.get('hrv_nonlinear', {})
 
         fig, axes = plt.subplots(2, 2, figsize=(11, 8.5))
-        fig.suptitle('Heart Rate Variability (HRV) Analysis', fontsize=14, fontweight='bold')
+        fig.suptitle(f'HRV Analysis - {ecg_result["sample_name"]}', fontsize=14, fontweight='bold')
 
+        # Time domain
         ax = axes[0, 0]
         ax.axis('off')
         ax.text(0.5, 0.98, 'Time Domain', fontsize=12, fontweight='bold', ha='center', transform=ax.transAxes)
         y = 0.88
-        for key in ['HRV_MeanNN', 'HRV_SDNN', 'HRV_RMSSD', 'HRV_pNN50', 'HRV_pNN20', 'HRV_MedianNN']:
+        for key in ['HRV_MeanNN', 'HRV_SDNN', 'HRV_RMSSD', 'HRV_pNN50', 'HRV_MedianNN']:
             if key in hrv_time:
                 name = METRIC_EXPLANATIONS.get(key, (key, ''))[0]
                 ax.text(0.05, y, f'{name}:', fontsize=10, transform=ax.transAxes)
-                ax.text(0.65, y, f'{hrv_time[key]:.2f}', fontsize=10, fontfamily='monospace', 
+                ax.text(0.65, y, f'{hrv_time[key]:.2f}', fontsize=10, fontfamily='monospace',
                        fontweight='bold', transform=ax.transAxes)
                 y -= 0.1
 
+        # Frequency domain
         ax = axes[0, 1]
         ax.axis('off')
         ax.text(0.5, 0.98, 'Frequency Domain', fontsize=12, fontweight='bold', ha='center', transform=ax.transAxes)
         y = 0.88
         if hrv_freq:
-            for key in ['HRV_VLF', 'HRV_LF', 'HRV_HF', 'HRV_LFHF', 'HRV_LFn', 'HRV_HFn']:
+            for key in ['HRV_VLF', 'HRV_LF', 'HRV_HF', 'HRV_LFHF']:
                 if key in hrv_freq:
                     name = METRIC_EXPLANATIONS.get(key, (key, ''))[0]
                     ax.text(0.05, y, f'{name}:', fontsize=10, transform=ax.transAxes)
@@ -1400,39 +1430,132 @@ class ReportGenerator(QThread):
                            fontweight='bold', transform=ax.transAxes)
                     y -= 0.1
         else:
-            ax.text(0.5, 0.5, 'Frequency analysis requires\n60+ seconds of recording',
-                   ha='center', va='center', transform=ax.transAxes, fontsize=11, color='gray')
+            ax.text(0.5, 0.5, 'Requires 60+ seconds', ha='center', va='center',
+                   transform=ax.transAxes, fontsize=11, color='gray')
 
+        # RR histogram
         ax = axes[1, 0]
         rr_ms = ecg_result.get('rr_intervals_ms', np.array([]))
         if len(rr_ms) >= 3:
             ax.hist(rr_ms, bins=15, color='steelblue', edgecolor='black', alpha=0.7)
-            ax.axvline(np.mean(rr_ms), color='red', linestyle='--', lw=2, label=f'Mean: {np.mean(rr_ms):.0f}ms')
-            ax.axvline(np.median(rr_ms), color='green', linestyle=':', lw=2, label=f'Median: {np.median(rr_ms):.0f}ms')
+            ax.axvline(np.mean(rr_ms), color='red', linestyle='--', lw=2)
             ax.set_xlabel('RR Interval (ms)')
             ax.set_ylabel('Count')
             ax.set_title('RR Distribution')
-            ax.legend(fontsize=8)
             ax.grid(True, alpha=0.3)
         else:
-            ax.text(0.5, 0.5, 'Insufficient data', ha='center', va='center', transform=ax.transAxes)
             ax.axis('off')
 
+        # Nonlinear
         ax = axes[1, 1]
         ax.axis('off')
         ax.text(0.5, 0.98, 'Nonlinear', fontsize=12, fontweight='bold', ha='center', transform=ax.transAxes)
         y = 0.88
         if hrv_nl:
-            for key in ['HRV_SD1', 'HRV_SD2', 'HRV_SD1SD2', 'HRV_ApEn', 'HRV_DFA_alpha1']:
+            for key in ['HRV_SD1', 'HRV_SD2', 'HRV_ApEn', 'HRV_DFA_alpha1']:
                 if key in hrv_nl:
                     name = METRIC_EXPLANATIONS.get(key, (key, ''))[0]
                     ax.text(0.05, y, f'{name}:', fontsize=10, transform=ax.transAxes)
                     ax.text(0.65, y, f'{hrv_nl[key]:.4f}', fontsize=10, fontfamily='monospace',
                            fontweight='bold', transform=ax.transAxes)
                     y -= 0.1
+
+        plt.tight_layout()
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close(fig)
+
+    def _page_ecg_comparison(self, pdf, plt, ecg_s1, ecg_s2):
+        """Compare ECG Sample 1 vs Sample 2"""
+        fig, axes = plt.subplots(2, 2, figsize=(11, 8.5))
+        fig.suptitle('ECG Comparison: Sample 1 vs Sample 2', fontsize=14, fontweight='bold')
+
+        # Compare heart rate
+        ax = axes[0, 0]
+        hr1 = ecg_s1.get('heart_rate', {})
+        hr2 = ecg_s2.get('heart_rate', {})
+        if hr1 and hr2:
+            labels = ['Sample 1\n(Best)', 'Sample 2\n(Full)']
+            means = [hr1['mean'], hr2['mean']]
+            stds = [hr1['std'], hr2['std']]
+            x = np.arange(len(labels))
+            ax.bar(x, means, yerr=stds, capsize=10, color=['#4CAF50', '#2196F3'], alpha=0.7)
+            ax.set_ylabel('Heart Rate (bpm)')
+            ax.set_title('Heart Rate Comparison')
+            ax.set_xticks(x)
+            ax.set_xticklabels(labels)
+            ax.grid(True, alpha=0.3, axis='y')
         else:
-            ax.text(0.5, 0.5, 'Nonlinear analysis requires\n10+ R-peaks',
-                   ha='center', va='center', transform=ax.transAxes, fontsize=11, color='gray')
+            ax.axis('off')
+
+        # Compare HRV metrics
+        ax = axes[0, 1]
+        hrv1 = ecg_s1.get('hrv_time', {})
+        hrv2 = ecg_s2.get('hrv_time', {})
+        if hrv1 and hrv2:
+            metrics = ['HRV_SDNN', 'HRV_RMSSD']
+            s1_vals = [hrv1.get(m, 0) for m in metrics]
+            s2_vals = [hrv2.get(m, 0) for m in metrics]
+            x = np.arange(len(metrics))
+            width = 0.35
+            ax.bar(x - width/2, s1_vals, width, label='Sample 1', color='#4CAF50', alpha=0.7)
+            ax.bar(x + width/2, s2_vals, width, label='Sample 2', color='#2196F3', alpha=0.7)
+            ax.set_ylabel('ms')
+            ax.set_title('HRV Time Domain')
+            ax.set_xticks(x)
+            ax.set_xticklabels([m.replace('HRV_', '') for m in metrics])
+            ax.legend()
+            ax.grid(True, alpha=0.3, axis='y')
+        else:
+            ax.axis('off')
+
+        # Compare intervals
+        ax = axes[1, 0]
+        int1 = ecg_s1.get('intervals', {})
+        int2 = ecg_s2.get('intervals', {})
+        if int1 and int2:
+            metrics = ['PR_Interval', 'QRS_Duration', 'QTc']
+            available = [m for m in metrics if m in int1 and m in int2]
+            if available:
+                s1_vals = [int1[m] for m in available]
+                s2_vals = [int2[m] for m in available]
+                x = np.arange(len(available))
+                width = 0.35
+                ax.bar(x - width/2, s1_vals, width, label='Sample 1', color='#4CAF50', alpha=0.7)
+                ax.bar(x + width/2, s2_vals, width, label='Sample 2', color='#2196F3', alpha=0.7)
+                ax.set_ylabel('ms')
+                ax.set_title('ECG Intervals')
+                ax.set_xticks(x)
+                ax.set_xticklabels([m.replace('_', ' ') for m in available], rotation=15)
+                ax.legend()
+                ax.grid(True, alpha=0.3, axis='y')
+        else:
+            ax.axis('off')
+
+        # Summary text
+        ax = axes[1, 1]
+        ax.axis('off')
+        ax.text(0.5, 0.95, 'Key Differences', fontsize=12, fontweight='bold', ha='center', transform=ax.transAxes)
+        
+        y = 0.85
+        text_items = []
+        
+        if hr1 and hr2:
+            hr_diff = abs(hr1['mean'] - hr2['mean'])
+            text_items.append(f"HR Difference: {hr_diff:.1f} bpm")
+        
+        if hrv1 and hrv2:
+            if 'HRV_SDNN' in hrv1 and 'HRV_SDNN' in hrv2:
+                sdnn_diff = abs(hrv1['HRV_SDNN'] - hrv2['HRV_SDNN'])
+                text_items.append(f"SDNN Difference: {sdnn_diff:.1f} ms")
+        
+        text_items.append(f"\nSample 1: {ecg_s1['duration_sec']:.1f}s")
+        text_items.append(f"Sample 2: {ecg_s2['duration_sec']:.1f}s")
+        text_items.append(f"\nR-peaks Sample 1: {len(ecg_s1.get('r_peaks', []))}")
+        text_items.append(f"R-peaks Sample 2: {len(ecg_s2.get('r_peaks', []))}")
+        
+        for item in text_items:
+            ax.text(0.1, y, item, fontsize=10, transform=ax.transAxes)
+            y -= 0.08
 
         plt.tight_layout()
         pdf.savefig(fig, bbox_inches='tight')
@@ -1440,78 +1563,379 @@ class ReportGenerator(QThread):
 
     def _page_ppg_signal(self, pdf, plt, ppg_result):
         fig, axes = plt.subplots(2, 2, figsize=(11, 8.5))
-        fig.suptitle('PPG Signal Analysis (MAX30102)', fontsize=14, fontweight='bold')
+        fig.suptitle(f'PPG Signals & Beat Segmentation - {ppg_result["sample_name"]}', fontsize=14, fontweight='bold')
 
         ir_raw = ppg_result['ir_raw']
         red_raw = ppg_result['red_raw']
-        ir_proc = ppg_result.get('ir_processed', {})
-        red_proc = ppg_result.get('red_processed', {})
         ir_peaks = ppg_result.get('ir_peaks', np.array([]))
         red_peaks = ppg_result.get('red_peaks', np.array([]))
 
         window = min(len(ir_raw), PPG_FS * 15)
         t = np.arange(window) / PPG_FS
 
+        # IR channel with beat segmentation
         ax = axes[0, 0]
-        ax.plot(t, ir_raw[:window], 'purple', lw=0.8, alpha=0.5, label='Raw IR')
-        if 'normalized' in ir_proc:
-            ir_norm = ir_proc['normalized'][:window]
-            ir_norm_scaled = (ir_norm - ir_norm.min()) / (ir_norm.max() - ir_norm.min() + 1e-10)
-            ir_norm_scaled = ir_norm_scaled * (ir_raw[:window].max() - ir_raw[:window].min()) + ir_raw[:window].min()
-            ax.plot(t, ir_norm_scaled, 'b-', lw=1.2, label='Processed')
+        ax.plot(t, ir_raw[:window], 'purple', lw=0.8)
         peaks_win = ir_peaks[ir_peaks < window]
         if len(peaks_win) > 0:
             ax.scatter(peaks_win/PPG_FS, ir_raw[peaks_win], color='green', s=60, marker='v', zorder=10)
+            # Add beat segmentation lines and PP intervals
+            for i in range(len(peaks_win) - 1):
+                if i < 8:  # Limit annotations
+                    # Draw vertical lines to show beat boundaries
+                    ax.axvline(peaks_win[i]/PPG_FS, color='cyan', linestyle='--', lw=0.8, alpha=0.5)
+                    # Show PP interval
+                    pp_ms = (peaks_win[i+1] - peaks_win[i]) / PPG_FS * 1000
+                    mid_t = (peaks_win[i] + peaks_win[i+1]) / 2 / PPG_FS
+                    y_pos = np.max(ir_raw[:window]) * 0.9
+                    ax.text(mid_t, y_pos, f'{pp_ms:.0f}ms', fontsize=7, ha='center',
+                           bbox=dict(boxstyle='round,pad=0.15', fc='yellow', alpha=0.8))
         ax.set_xlabel('Time (s)')
-        ax.set_ylabel('ADC Counts')
-        ax.set_title(f'IR Channel - {len(ir_peaks)} peaks detected')
-        ax.legend(fontsize=8)
+        ax.set_ylabel('ADC')
+        ax.set_title(f'IR Channel - {len(ir_peaks)} peaks - Beat Segmentation')
         ax.grid(True, alpha=0.3)
 
+        # Red channel with beat segmentation
         ax = axes[0, 1]
-        ax.plot(t, red_raw[:window], 'red', lw=0.8, alpha=0.5, label='Raw Red')
-        if 'normalized' in red_proc:
-            red_norm = red_proc['normalized'][:window]
-            red_norm_scaled = (red_norm - red_norm.min()) / (red_norm.max() - red_norm.min() + 1e-10)
-            red_norm_scaled = red_norm_scaled * (red_raw[:window].max() - red_raw[:window].min()) + red_raw[:window].min()
-            ax.plot(t, red_norm_scaled, 'darkred', lw=1.2, label='Processed')
+        ax.plot(t, red_raw[:window], 'red', lw=0.8)
         peaks_win = red_peaks[red_peaks < window]
         if len(peaks_win) > 0:
             ax.scatter(peaks_win/PPG_FS, red_raw[peaks_win], color='green', s=60, marker='v', zorder=10)
+            # Add beat segmentation
+            for i in range(len(peaks_win) - 1):
+                if i < 8:
+                    ax.axvline(peaks_win[i]/PPG_FS, color='cyan', linestyle='--', lw=0.8, alpha=0.5)
+                    pp_ms = (peaks_win[i+1] - peaks_win[i]) / PPG_FS * 1000
+                    mid_t = (peaks_win[i] + peaks_win[i+1]) / 2 / PPG_FS
+                    y_pos = np.max(red_raw[:window]) * 0.9
+                    ax.text(mid_t, y_pos, f'{pp_ms:.0f}ms', fontsize=7, ha='center',
+                           bbox=dict(boxstyle='round,pad=0.15', fc='yellow', alpha=0.8))
         ax.set_xlabel('Time (s)')
-        ax.set_ylabel('ADC Counts')
-        ax.set_title(f'Red Channel - {len(red_peaks)} peaks detected')
-        ax.legend(fontsize=8)
+        ax.set_ylabel('ADC')
+        ax.set_title(f'Red Channel - {len(red_peaks)} peaks - Beat Segmentation')
         ax.grid(True, alpha=0.3)
 
+        # Pulse rate with statistics
         ax = axes[1, 0]
         hr = ppg_result.get('heart_rate')
         if hr and 'values' in hr and len(hr['values']) > 2:
-            ax.plot(hr['values'], 'g-', lw=1)
-            ax.axhline(hr['mean'], color='red', linestyle='--', lw=2, label=f'Mean: {hr["mean"]:.1f} bpm')
-            ax.fill_between(range(len(hr['values'])), hr['mean']-hr['std'], hr['mean']+hr['std'], 
+            ax.plot(hr['values'], 'g-o', markersize=4, lw=1)
+            ax.axhline(hr['mean'], color='red', linestyle='--', lw=2, label=f"Mean: {hr['mean']:.1f} bpm")
+            ax.fill_between(range(len(hr['values'])), hr['mean']-hr['std'], hr['mean']+hr['std'],
                            alpha=0.2, color='green')
             ax.set_xlabel('Beat #')
-            ax.set_ylabel('Heart Rate (bpm)')
+            ax.set_ylabel('Pulse Rate (bpm)')
             ax.set_title('Pulse Rate from PPG')
             ax.legend(fontsize=8)
             ax.grid(True, alpha=0.3)
         else:
-            ax.text(0.5, 0.5, 'Insufficient HR data', ha='center', va='center', transform=ax.transAxes)
             ax.axis('off')
 
+        # PP intervals with timing info
         ax = axes[1, 1]
         pp_ms = ppg_result.get('pp_intervals_ms', np.array([]))
         if len(pp_ms) >= 3:
             ax.hist(pp_ms, bins=15, color='purple', edgecolor='black', alpha=0.7)
-            ax.axvline(np.mean(pp_ms), color='red', linestyle='--', lw=2, label=f'Mean: {np.mean(pp_ms):.0f}ms')
+            ax.axvline(np.mean(pp_ms), color='red', linestyle='--', lw=2, 
+                      label=f'Mean: {np.mean(pp_ms):.0f}ms')
+            ax.axvline(np.median(pp_ms), color='green', linestyle=':', lw=2,
+                      label=f'Median: {np.median(pp_ms):.0f}ms')
+            stats_text = f'Std: {np.std(pp_ms):.0f}ms\nRange: {np.min(pp_ms):.0f}-{np.max(pp_ms):.0f}ms'
+            ax.text(0.98, 0.95, stats_text, transform=ax.transAxes, fontsize=8, va='top', ha='right',
+                   bbox=dict(boxstyle='round', fc='lightyellow', alpha=0.9))
             ax.set_xlabel('PP Interval (ms)')
             ax.set_ylabel('Count')
-            ax.set_title('Peak-to-Peak Distribution')
+            ax.set_title('Peak-to-Peak Interval Distribution')
             ax.legend(fontsize=8)
             ax.grid(True, alpha=0.3)
         else:
-            ax.text(0.5, 0.5, 'Insufficient PP data', ha='center', va='center', transform=ax.transAxes)
+            ax.axis('off')
+
+        plt.tight_layout()
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close(fig)
+        
+        # If this is a long recording (Sample 2), create an extra-wide scrollable view
+        if ppg_result['duration_sec'] > 20 and "Sample2" in ppg_result["sample_name"]:
+            self._page_ppg_signal_wide(pdf, plt, ppg_result)
+    
+    def _page_ppg_signal_wide(self, pdf, plt, ppg_result):
+        """Create extra-wide landscape page for full PPG signal visualization"""
+        ir_raw = ppg_result['ir_raw']
+        red_raw = ppg_result['red_raw']
+        ir_peaks = ppg_result.get('ir_peaks', np.array([]))
+        red_peaks = ppg_result.get('red_peaks', np.array([]))
+        duration = ppg_result['duration_sec']
+        
+        # Calculate width based on duration: 1 inch per 3 seconds for PPG
+        fig_width = max(20, duration / 3)
+        fig_width = min(fig_width, 200)  # Cap at 200 inches
+        
+        fig, axes = plt.subplots(2, 1, figsize=(fig_width, 11))
+        fig.suptitle(f'PPG Signals - {ppg_result["sample_name"]} - FULL SCROLLABLE VIEW', 
+                    fontsize=16, fontweight='bold')
+        
+        t = np.arange(len(ir_raw)) / PPG_FS
+        
+        # IR channel with ALL peak annotations
+        ax = axes[0]
+        ax.plot(t, ir_raw, 'purple', lw=1.0)
+        if len(ir_peaks) > 0:
+            ax.scatter(ir_peaks/PPG_FS, ir_raw[ir_peaks], color='green', s=100, marker='v', zorder=10)
+            # Add ALL PP intervals
+            for i in range(len(ir_peaks) - 1):
+                pp_ms = (ir_peaks[i+1] - ir_peaks[i]) / PPG_FS * 1000
+                mid_t = (ir_peaks[i] + ir_peaks[i+1]) / 2 / PPG_FS
+                y_pos = np.max(ir_raw) * 0.95
+                ax.text(mid_t, y_pos, f'{pp_ms:.0f}', fontsize=6, ha='center',
+                       bbox=dict(boxstyle='round,pad=0.1', fc='yellow', alpha=0.6))
+                # Draw beat segmentation lines
+                ax.axvline(ir_peaks[i]/PPG_FS, color='cyan', linestyle='--', lw=0.8, alpha=0.4)
+        ax.set_xlim(0, duration)
+        ax.set_ylabel('ADC', fontsize=12, fontweight='bold')
+        ax.set_title(f'IR Channel - {len(ir_peaks)} peaks - All PP Intervals (ms)', fontsize=12)
+        ax.grid(True, alpha=0.3)
+        
+        # Red channel with peak annotations
+        ax = axes[1]
+        ax.plot(t, red_raw, 'red', lw=1.0)
+        if len(red_peaks) > 0:
+            ax.scatter(red_peaks/PPG_FS, red_raw[red_peaks], color='green', s=100, marker='v', zorder=10)
+            # Add PP intervals
+            for i in range(len(red_peaks) - 1):
+                pp_ms = (red_peaks[i+1] - red_peaks[i]) / PPG_FS * 1000
+                mid_t = (red_peaks[i] + red_peaks[i+1]) / 2 / PPG_FS
+                y_pos = np.max(red_raw) * 0.95
+                ax.text(mid_t, y_pos, f'{pp_ms:.0f}', fontsize=6, ha='center',
+                       bbox=dict(boxstyle='round,pad=0.1', fc='yellow', alpha=0.6))
+                # Draw beat segmentation lines
+                ax.axvline(red_peaks[i]/PPG_FS, color='cyan', linestyle='--', lw=0.8, alpha=0.4)
+        ax.set_xlim(0, duration)
+        ax.set_ylabel('ADC', fontsize=12, fontweight='bold')
+        ax.set_xlabel('Time (s)', fontsize=12, fontweight='bold')
+        ax.set_title(f'Red Channel - {len(red_peaks)} peaks - All PP Intervals (ms)', fontsize=12)
+        ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close(fig)
+        print(f"[PDF] Created wide PPG page: {fig_width:.1f} inches x 11 inches")
+
+    def _page_ppg_beat_segmentation(self, pdf, plt, ppg_result):
+        """Show individual PPG beats and morphology with improved visualization"""
+        fig, axes = plt.subplots(2, 2, figsize=(11, 8.5))
+        fig.suptitle(f'PPG Beat Morphology & Segmentation - {ppg_result["sample_name"]}', fontsize=14, fontweight='bold')
+
+        ir_raw = ppg_result['ir_raw']
+        ir_proc = ppg_result.get('ir_processed', {})
+        ir_peaks = ppg_result.get('ir_peaks', np.array([]))
+        pp_ms = ppg_result.get('pp_intervals_ms', np.array([]))
+
+        # Panel 1: ALL Individual Beats Overlapping (normalized and aligned)
+        ax = axes[0, 0]
+        if len(ir_peaks) >= 3:
+            # Extract all beats
+            beats = []
+            for i in range(len(ir_peaks) - 1):
+                start_idx = ir_peaks[i]
+                end_idx = ir_peaks[i + 1]
+                if end_idx - start_idx > 5:  # Valid beat
+                    beat = ir_raw[start_idx:end_idx]
+                    # Normalize each beat to 0-1 for comparison
+                    beat_norm = (beat - np.min(beat)) / (np.max(beat) - np.min(beat) + 1e-10)
+                    beats.append((beat_norm, len(beat)))
+            
+            if len(beats) >= 3:
+                # Find median length for alignment
+                median_len = int(np.median([b[1] for b in beats]))
+                
+                # Resample all beats to common length and plot WITH CLEAR OVERLAP
+                from scipy.interpolate import interp1d
+                n_beats_show = min(30, len(beats))  # Show up to 30 beats for better visualization
+                
+                for i, (beat_norm, beat_len) in enumerate(beats[:n_beats_show]):
+                    # Resample to median length
+                    if beat_len != median_len:
+                        x_old = np.linspace(0, 1, beat_len)
+                        x_new = np.linspace(0, 1, median_len)
+                        try:
+                            f = interp1d(x_old, beat_norm, kind='cubic')
+                            beat_resampled = f(x_new)
+                        except:
+                            beat_resampled = beat_norm[:median_len] if beat_len >= median_len else np.pad(beat_norm, (0, median_len - beat_len))
+                    else:
+                        beat_resampled = beat_norm
+                    
+                    # Use rainbow colors with varying transparency
+                    alpha = 0.5 if i < 10 else (0.3 if i < 20 else 0.2)
+                    color = plt.cm.rainbow(i / n_beats_show)
+                    t_beat = np.arange(median_len) / PPG_FS * 1000
+                    ax.plot(t_beat, beat_resampled, color=color, lw=1.8, alpha=alpha, zorder=n_beats_show-i)
+                
+                ax.set_xlabel('Time (ms)', fontweight='bold')
+                ax.set_ylabel('Normalized Amplitude (0-1)', fontweight='bold')
+                ax.set_title(f'{n_beats_show} Beats Overlaid - Morphology Consistency', fontweight='bold')
+                ax.grid(True, alpha=0.3)
+                ax.set_ylim(-0.05, 1.05)
+                ax.text(0.02, 0.98, f'Total Beats: {len(beats)}\nShowing: {n_beats_show}', 
+                       transform=ax.transAxes, fontsize=8, ha='left', va='top',
+                       bbox=dict(boxstyle='round', fc='lightyellow', alpha=0.9))
+            else:
+                ax.axis('off')
+                ax.text(0.5, 0.5, 'Insufficient beats', ha='center', va='center', transform=ax.transAxes)
+        else:
+            ax.axis('off')
+            ax.text(0.5, 0.5, 'Insufficient peaks', ha='center', va='center', transform=ax.transAxes)
+
+        # Panel 2: Average Beat with ALL Individual Beats (semi-transparent) - ACTUAL ADC VALUES
+        ax = axes[0, 1]
+        if len(ir_peaks) >= 5:
+            beats_raw = []
+            for i in range(len(ir_peaks) - 1):
+                start_idx = ir_peaks[i]
+                end_idx = ir_peaks[i + 1]
+                if end_idx - start_idx > 5:
+                    beat = ir_raw[start_idx:end_idx]
+                    beats_raw.append(beat)
+            
+            if len(beats_raw) >= 3:
+                # Find minimum length
+                min_len = min(len(b) for b in beats_raw)
+                beats_arr = np.array([b[:min_len] for b in beats_raw])
+                
+                # Plot ALL individual beats in background (very transparent)
+                t_beat = np.arange(min_len) / PPG_FS * 1000
+                n_beats_show = min(50, len(beats_arr))
+                for i in range(n_beats_show):
+                    alpha = 0.08 if i >= 20 else 0.12
+                    ax.plot(t_beat, beats_arr[i], color='gray', lw=0.6, alpha=alpha, zorder=1)
+                
+                # Calculate and plot mean ± SD (bold)
+                mean_beat = np.mean(beats_arr, axis=0)
+                std_beat = np.std(beats_arr, axis=0)
+                
+                ax.fill_between(t_beat, mean_beat - std_beat, mean_beat + std_beat, 
+                               alpha=0.4, color='purple', label='±1 SD', zorder=2)
+                ax.plot(t_beat, mean_beat, 'purple', lw=3.5, label='Mean Beat', zorder=3)
+                
+                # Mark systolic and diastolic points
+                peak_idx = np.argmax(mean_beat)
+                valley_idx = np.argmin(mean_beat)
+                ax.plot(t_beat[peak_idx], mean_beat[peak_idx], 'ro', markersize=12, 
+                       label='Systolic Peak', zorder=4)
+                ax.plot(t_beat[valley_idx], mean_beat[valley_idx], 'bs', markersize=12,
+                       label='Diastolic Valley', zorder=4)
+                
+                ax.set_xlabel('Time (ms)', fontweight='bold')
+                ax.set_ylabel('ADC Value', fontweight='bold')
+                ax.set_title(f'Mean Beat with All {len(beats_arr)} Beats Overlaid', fontweight='bold')
+                ax.legend(fontsize=8, loc='upper right')
+                ax.grid(True, alpha=0.3)
+            else:
+                ax.axis('off')
+        else:
+            ax.axis('off')
+
+        # Panel 3: Beat Morphology Metrics
+        ax = axes[1, 0]
+        if len(ir_peaks) >= 3:
+            # Calculate beat characteristics
+            beat_metrics = {
+                'amplitudes': [],
+                'widths_50': [],  # Width at 50% amplitude
+                'rise_times': [],
+                'fall_times': []
+            }
+            
+            for i in range(len(ir_peaks) - 1):
+                start_idx = ir_peaks[i]
+                end_idx = ir_peaks[i + 1]
+                if end_idx - start_idx > 5:
+                    beat = ir_raw[start_idx:end_idx]
+                    
+                    # Amplitude
+                    amplitude = np.max(beat) - np.min(beat)
+                    beat_metrics['amplitudes'].append(amplitude)
+                    
+                    # Width at 50% (pulse width)
+                    min_val = np.min(beat)
+                    max_val = np.max(beat)
+                    half_amp = min_val + (max_val - min_val) * 0.5
+                    
+                    # Find indices where signal crosses 50%
+                    above_half = beat < half_amp  # Inverted PPG
+                    if np.sum(above_half) > 0:
+                        indices = np.where(above_half)[0]
+                        if len(indices) > 1:
+                            width = (indices[-1] - indices[0]) / PPG_FS * 1000  # ms
+                            beat_metrics['widths_50'].append(width)
+            
+            # Plot metrics if available
+            if beat_metrics['amplitudes']:
+                metrics_to_plot = []
+                labels = []
+                
+                if beat_metrics['amplitudes']:
+                    metrics_to_plot.append(beat_metrics['amplitudes'])
+                    labels.append(f'Amplitude\n{np.mean(beat_metrics["amplitudes"]):.0f}±{np.std(beat_metrics["amplitudes"]):.0f}')
+                
+                if beat_metrics['widths_50']:
+                    metrics_to_plot.append(beat_metrics['widths_50'])
+                    labels.append(f'Width@50%\n{np.mean(beat_metrics["widths_50"]):.0f}±{np.std(beat_metrics["widths_50"]):.0f}ms')
+                
+                if pp_ms is not None and len(pp_ms) > 0:
+                    metrics_to_plot.append(pp_ms)
+                    labels.append(f'PP Interval\n{np.mean(pp_ms):.0f}±{np.std(pp_ms):.0f}ms')
+                
+                # Create box plot
+                bp = ax.boxplot(metrics_to_plot, labels=labels, patch_artist=True)
+                for patch, color in zip(bp['boxes'], ['lightblue', 'lightgreen', 'lightcoral']):
+                    patch.set_facecolor(color)
+                
+                ax.set_ylabel('Value')
+                ax.set_title('Beat Morphology Metrics')
+                ax.grid(True, alpha=0.3, axis='y')
+                ax.tick_params(axis='x', labelsize=8)
+            else:
+                ax.axis('off')
+        else:
+            ax.axis('off')
+
+        # Panel 4: PP Interval Variability with Quality Indicators
+        ax = axes[1, 1]
+        if len(pp_ms) >= 3:
+            beat_numbers = np.arange(1, len(pp_ms) + 1)
+            
+            # Color code by variability
+            colors = []
+            threshold = np.std(pp_ms)
+            mean_pp = np.mean(pp_ms)
+            for val in pp_ms:
+                if abs(val - mean_pp) < threshold * 0.5:
+                    colors.append('green')  # Good consistency
+                elif abs(val - mean_pp) < threshold:
+                    colors.append('yellow')  # Moderate variation
+                else:
+                    colors.append('red')  # High variation
+            
+            ax.scatter(beat_numbers, pp_ms, c=colors, s=50, alpha=0.7, edgecolors='black', linewidths=0.5)
+            ax.plot(beat_numbers, pp_ms, 'k-', lw=0.8, alpha=0.3)
+            ax.axhline(mean_pp, color='blue', linestyle='--', lw=2, label=f'Mean: {mean_pp:.0f}ms')
+            ax.fill_between(beat_numbers, mean_pp - np.std(pp_ms), mean_pp + np.std(pp_ms),
+                           alpha=0.2, color='blue', label=f'±1 SD')
+            
+            # Add coefficient of variation
+            cv = (np.std(pp_ms) / np.mean(pp_ms)) * 100
+            ax.text(0.02, 0.98, f'CV: {cv:.1f}%\nGreen: Consistent\nYellow: Moderate\nRed: Variable', 
+                   transform=ax.transAxes, fontsize=8, va='top',
+                   bbox=dict(boxstyle='round', fc='white', alpha=0.9))
+            
+            ax.set_xlabel('Beat Number')
+            ax.set_ylabel('PP Interval (ms)')
+            ax.set_title('Beat-to-Beat Interval Variability')
+            ax.legend(fontsize=8, loc='upper right')
+            ax.grid(True, alpha=0.3)
+        else:
             ax.axis('off')
 
         plt.tight_layout()
@@ -1519,237 +1943,280 @@ class ReportGenerator(QThread):
         plt.close(fig)
 
     def _page_ppg_analysis(self, pdf, plt, ppg_result):
+        # [SpO2, perfusion, PRV metrics]
         fig, axes = plt.subplots(2, 2, figsize=(11, 8.5))
-        fig.suptitle('PPG Analysis - SpO2 & Pulse Rate Variability', fontsize=14, fontweight='bold')
+        fig.suptitle(f'PPG Analysis - {ppg_result["sample_name"]}', fontsize=14, fontweight='bold')
 
+        # SpO2
         ax = axes[0, 0]
         ax.axis('off')
-        ax.text(0.5, 0.98, 'Oxygen Saturation (SpO2)', fontsize=12, fontweight='bold', ha='center', transform=ax.transAxes)
-        
+        ax.text(0.5, 0.98, 'Oxygen Saturation', fontsize=12, fontweight='bold', ha='center', transform=ax.transAxes)
         spo2 = ppg_result.get('spo2')
-        spo2_data = ppg_result.get('spo2_data', {})
-        pi = ppg_result.get('perfusion_index')
-        
-        y = 0.85
         if spo2:
             color = 'green' if spo2 >= 95 else ('orange' if spo2 >= 90 else 'red')
-            ax.text(0.5, y, f'{spo2}%', fontsize=48, fontweight='bold', ha='center', 
+            ax.text(0.5, 0.65, f'{spo2}%', fontsize=48, fontweight='bold', ha='center',
                    transform=ax.transAxes, color=color)
-            y -= 0.2
-            ax.text(0.5, y, 'Oxygen Saturation', fontsize=12, ha='center', transform=ax.transAxes)
-            y -= 0.1
-            if 'r_ratios' in spo2_data and spo2_data['r_ratios']:
-                ax.text(0.5, y, f'R-ratio: {np.mean(spo2_data["r_ratios"]):.3f}', 
-                       fontsize=10, ha='center', transform=ax.transAxes, color='gray')
+            ax.text(0.5, 0.4, 'SpO2', fontsize=12, ha='center', transform=ax.transAxes)
         else:
-            ax.text(0.5, 0.5, 'SpO2 calculation\nnot available', ha='center', va='center',
+            ax.text(0.5, 0.5, 'Not available', ha='center', va='center',
                    transform=ax.transAxes, fontsize=14, color='gray')
-        
+
+        # Perfusion & Quality
         ax = axes[0, 1]
         ax.axis('off')
-        ax.text(0.5, 0.98, 'Perfusion & Signal Quality', fontsize=12, fontweight='bold', ha='center', transform=ax.transAxes)
-        
+        ax.text(0.5, 0.98, 'Signal Quality', fontsize=12, fontweight='bold', ha='center', transform=ax.transAxes)
         y = 0.82
         items = []
-        if pi:
-            items.append(('Perfusion Index (IR)', f'{pi:.2f}%'))
-        if spo2_data.get('perfusion_index_red'):
-            items.append(('Perfusion Index (Red)', f'{spo2_data["perfusion_index_red"]:.2f}%'))
+        if ppg_result.get('perfusion_index'):
+            items.append(('Perfusion Index', f'{ppg_result["perfusion_index"]:.2f}%'))
         if ppg_result.get('signal_quality'):
             items.append(('Signal Quality', f'{ppg_result["signal_quality"]:.3f}'))
-        
         hr = ppg_result.get('heart_rate')
         if hr:
             items.append(('Pulse Rate', f'{hr["mean"]:.1f} ± {hr["std"]:.1f} bpm'))
-            items.append(('PR Range', f'{hr["min"]:.0f} - {hr["max"]:.0f} bpm'))
-        
-        items.append(('IR Peaks', f'{len(ppg_result.get("ir_peaks", []))}'))
-        items.append(('Red Peaks', f'{len(ppg_result.get("red_peaks", []))}'))
         
         for label, value in items:
             ax.text(0.1, y, f'{label}:', fontsize=10, transform=ax.transAxes)
             ax.text(0.6, y, value, fontsize=10, fontfamily='monospace', fontweight='bold', transform=ax.transAxes)
             y -= 0.08
 
+        # PRV Time Domain
         ax = axes[1, 0]
         ax.axis('off')
         ax.text(0.5, 0.98, 'PRV Time Domain', fontsize=12, fontweight='bold', ha='center', transform=ax.transAxes)
         prv_time = ppg_result.get('prv_time', {})
         y = 0.85
         if prv_time:
-            for key, val in prv_time.items():
+            for key, val in list(prv_time.items())[:5]:
                 ax.text(0.1, y, f'{key}:', fontsize=10, transform=ax.transAxes)
                 ax.text(0.6, y, f'{val:.2f}', fontsize=10, fontfamily='monospace', fontweight='bold', transform=ax.transAxes)
                 y -= 0.1
         else:
-            ax.text(0.5, 0.5, 'PRV requires 5+ peaks', ha='center', va='center',
+            ax.text(0.5, 0.5, 'Requires 5+ peaks', ha='center', va='center',
                    transform=ax.transAxes, fontsize=11, color='gray')
 
+        # Poincaré plot
         ax = axes[1, 1]
         pp_ms = ppg_result.get('pp_intervals_ms', np.array([]))
         if len(pp_ms) >= 3:
             pp1, pp2 = pp_ms[:-1], pp_ms[1:]
-            ax.scatter(pp1, pp2, alpha=0.7, s=50, c='purple', edgecolors='darkviolet')
-            min_v, max_v = min(pp1.min(), pp2.min())*0.95, max(pp1.max(), pp2.max())*1.05
-            ax.plot([min_v, max_v], [min_v, max_v], 'r--', alpha=0.5)
-            prv_nl = ppg_result.get('prv_nonlinear', {})
-            if prv_nl:
-                info = ""
-                for k in ['PRV_SD1', 'PRV_SD2']:
-                    if k in prv_nl:
-                        info += f'{k}: {prv_nl[k]:.1f}ms\n'
-                if info:
-                    ax.text(0.05, 0.95, info.strip(), transform=ax.transAxes, fontsize=10, va='top',
-                           bbox=dict(boxstyle='round', fc='lightyellow', alpha=0.9))
+            ax.scatter(pp1, pp2, alpha=0.7, s=50, c='purple')
             ax.set_xlabel('PP(n) ms')
             ax.set_ylabel('PP(n+1) ms')
             ax.set_title('PPG Poincaré Plot')
             ax.grid(True, alpha=0.3)
             ax.set_aspect('equal', adjustable='box')
         else:
-            ax.text(0.5, 0.5, 'Insufficient data', ha='center', va='center', transform=ax.transAxes)
             ax.axis('off')
 
         plt.tight_layout()
         pdf.savefig(fig, bbox_inches='tight')
         plt.close(fig)
 
-    def _page_full_recording(self, pdf, plt, start_idx, end_idx):
-        fig, ax = plt.subplots(figsize=(11, 8.5))
-        
-        ecg_mv = self.ecg_data / 1000.0
-        max_pts = 8000
-        if len(ecg_mv) > max_pts:
-            factor = len(ecg_mv) // max_pts
-            ecg_ds = ecg_mv[::factor]
-            t = np.arange(len(ecg_ds)) * factor / ECG_FS
-        else:
-            ecg_ds = ecg_mv
-            t = np.arange(len(ecg_ds)) / ECG_FS
+    def _page_ppg_comparison(self, pdf, plt, ppg_s1, ppg_s2):
+        """Compare PPG Sample 1 vs Sample 2"""
+        fig, axes = plt.subplots(2, 2, figsize=(11, 8.5))
+        fig.suptitle('PPG Comparison: Sample 1 vs Sample 2', fontsize=14, fontweight='bold')
 
-        ax.plot(t, ecg_ds, 'b-', lw=0.5, alpha=0.8)
-        ax.axvspan(start_idx/ECG_FS, end_idx/ECG_FS, alpha=0.3, color='green', label='Analysis Window')
-        ax.set_xlabel('Time (s)')
-        ax.set_ylabel('Amplitude (mV)')
-        ax.set_title(f'Full ECG Recording ({len(self.ecg_data)/ECG_FS:.1f}s)')
-        ax.legend(loc='upper right')
-        ax.grid(True, alpha=0.3)
+        # Compare pulse rate
+        ax = axes[0, 0]
+        hr1 = ppg_s1.get('heart_rate', {})
+        hr2 = ppg_s2.get('heart_rate', {})
+        if hr1 and hr2:
+            labels = ['Sample 1\n(Best)', 'Sample 2\n(Full)']
+            means = [hr1['mean'], hr2['mean']]
+            stds = [hr1['std'], hr2['std']]
+            x = np.arange(len(labels))
+            ax.bar(x, means, yerr=stds, capsize=10, color=['#4CAF50', '#2196F3'], alpha=0.7)
+            ax.set_ylabel('Pulse Rate (bpm)')
+            ax.set_title('Pulse Rate Comparison')
+            ax.set_xticks(x)
+            ax.set_xticklabels(labels)
+            ax.grid(True, alpha=0.3, axis='y')
+        else:
+            ax.axis('off')
+
+        # Compare SpO2
+        ax = axes[0, 1]
+        spo2_1 = ppg_s1.get('spo2')
+        spo2_2 = ppg_s2.get('spo2')
+        if spo2_1 and spo2_2:
+            labels = ['Sample 1', 'Sample 2']
+            values = [spo2_1, spo2_2]
+            x = np.arange(len(labels))
+            colors = ['green' if v >= 95 else 'orange' if v >= 90 else 'red' for v in values]
+            ax.bar(x, values, color=colors, alpha=0.7)
+            ax.set_ylabel('SpO2 (%)')
+            ax.set_title('SpO2 Comparison')
+            ax.set_xticks(x)
+            ax.set_xticklabels(labels)
+            ax.set_ylim([80, 100])
+            ax.grid(True, alpha=0.3, axis='y')
+        else:
+            ax.axis('off')
+
+        # Compare PRV metrics
+        ax = axes[1, 0]
+        prv1 = ppg_s1.get('prv_time', {})
+        prv2 = ppg_s2.get('prv_time', {})
+        if prv1 and prv2:
+            metrics = ['PRV_SDNN', 'PRV_RMSSD']
+            available = [m for m in metrics if m in prv1 and m in prv2]
+            if available:
+                s1_vals = [prv1[m] for m in available]
+                s2_vals = [prv2[m] for m in available]
+                x = np.arange(len(available))
+                width = 0.35
+                ax.bar(x - width/2, s1_vals, width, label='Sample 1', color='#4CAF50', alpha=0.7)
+                ax.bar(x + width/2, s2_vals, width, label='Sample 2', color='#2196F3', alpha=0.7)
+                ax.set_ylabel('ms')
+                ax.set_title('PRV Comparison')
+                ax.set_xticks(x)
+                ax.set_xticklabels([m.replace('PRV_', '') for m in available])
+                ax.legend()
+                ax.grid(True, alpha=0.3, axis='y')
+        else:
+            ax.axis('off')
+
+        # Summary text
+        ax = axes[1, 1]
+        ax.axis('off')
+        ax.text(0.5, 0.95, 'Key Differences', fontsize=12, fontweight='bold', ha='center', transform=ax.transAxes)
         
+        y = 0.85
+        text_items = []
+        
+        if hr1 and hr2:
+            pr_diff = abs(hr1['mean'] - hr2['mean'])
+            text_items.append(f"Pulse Rate Diff: {pr_diff:.1f} bpm")
+        
+        if spo2_1 and spo2_2:
+            spo2_diff = abs(spo2_1 - spo2_2)
+            text_items.append(f"SpO2 Difference: {spo2_diff:.0f}%")
+        
+        text_items.append(f"\nSample 1: {ppg_s1['duration_sec']:.1f}s")
+        text_items.append(f"Sample 2: {ppg_s2['duration_sec']:.1f}s")
+        text_items.append(f"\nIR peaks Sample 1: {len(ppg_s1.get('ir_peaks', []))}")
+        text_items.append(f"IR peaks Sample 2: {len(ppg_s2.get('ir_peaks', []))}")
+        
+        for item in text_items:
+            ax.text(0.1, y, item, fontsize=10, transform=ax.transAxes)
+            y -= 0.08
+
+        plt.tight_layout()
         pdf.savefig(fig, bbox_inches='tight')
         plt.close(fig)
 
-    def _page_summary(self, pdf, plt, ecg_result, ppg_result, snr):
+    def _page_summary(self, pdf, plt, ecg_s1, ecg_s2, ppg_s1, ppg_s2):
         fig, ax = plt.subplots(figsize=(11, 8.5))
         ax.axis('off')
-        ax.text(0.5, 0.97, 'Summary', fontsize=18, fontweight='bold', ha='center', transform=ax.transAxes)
+        ax.text(0.5, 0.97, 'Summary - All Samples', fontsize=18, fontweight='bold', ha='center', transform=ax.transAxes)
         
         y = 0.90
         
-        ax.text(0.05, y, 'ECG Results:', fontsize=13, fontweight='bold', transform=ax.transAxes, color='#2060a0')
+        # ECG Sample 1
+        ax.text(0.05, y, 'ECG Sample 1 (Best 5s Window - Basic Analysis):', fontsize=13, fontweight='bold', transform=ax.transAxes, color='#2060a0')
         y -= 0.03
-        hr = ecg_result.get('heart_rate')
-        ecg_items = [('Signal SNR', f'{snr:.1f} dB')]
-        if hr:
-            ecg_items.append(('Heart Rate', f'{hr["mean"]:.1f} ± {hr["std"]:.1f} bpm'))
-        intervals = ecg_result.get('intervals', {})
-        for k in ['PR_Interval', 'QRS_Duration', 'QTc']:
-            if k in intervals:
-                ecg_items.append((k.replace('_', ' '), f'{intervals[k]:.0f} ms'))
-        hrv_t = ecg_result.get('hrv_time', {})
-        for k in ['HRV_SDNN', 'HRV_RMSSD']:
-            if k in hrv_t:
-                ecg_items.append((k.replace('HRV_', ''), f'{hrv_t[k]:.1f} ms'))
-        
-        for label, value in ecg_items:
-            ax.text(0.07, y, f'{label}:', fontsize=10, transform=ax.transAxes)
-            ax.text(0.35, y, value, fontsize=10, fontfamily='monospace', transform=ax.transAxes)
-            y -= 0.025
-
-        if ppg_result:
-            y -= 0.02
-            ax.text(0.05, y, 'PPG Results:', fontsize=13, fontweight='bold', transform=ax.transAxes, color='#a02060')
-            y -= 0.03
-            ppg_items = []
-            if ppg_result.get('spo2'):
-                ppg_items.append(('SpO2', f'{ppg_result["spo2"]}%'))
-            if ppg_result.get('perfusion_index'):
-                ppg_items.append(('Perfusion Index', f'{ppg_result["perfusion_index"]:.2f}%'))
-            ppg_hr = ppg_result.get('heart_rate')
-            if ppg_hr:
-                ppg_items.append(('Pulse Rate', f'{ppg_hr["mean"]:.1f} ± {ppg_hr["std"]:.1f} bpm'))
-            prv_t = ppg_result.get('prv_time', {})
-            for k in ['PRV_SDNN', 'PRV_RMSSD']:
-                if k in prv_t:
-                    ppg_items.append((k.replace('PRV_', 'PRV '), f'{prv_t[k]:.1f} ms'))
-            
-            for label, value in ppg_items:
+        if ecg_s1:
+            hr1 = ecg_s1.get('heart_rate', {})
+            items = [
+                ('Duration', f'{ecg_s1["duration_sec"]:.1f}s'),
+                ('R-peaks', f'{len(ecg_s1.get("r_peaks", []))}'),
+                ('Analysis Type', 'Time-domain only'),
+            ]
+            if hr1:
+                items.append(('Heart Rate', f'{hr1["mean"]:.1f} ± {hr1["std"]:.1f} bpm'))
+            for label, value in items:
                 ax.text(0.07, y, f'{label}:', fontsize=10, transform=ax.transAxes)
-                ax.text(0.35, y, value, fontsize=10, fontfamily='monospace', transform=ax.transAxes)
+                ax.text(0.45, y, value, fontsize=10, fontfamily='monospace', transform=ax.transAxes)
                 y -= 0.025
-
-        y -= 0.03
-        ax.text(0.05, y, 'Device:', fontsize=12, fontweight='bold', transform=ax.transAxes, color='#206020')
-        y -= 0.03
-        device_items = [
-            ('ECG', f'AD8232 @ {ECG_FS}Hz'),
-            ('PPG', f'MAX30102 @ {PPG_FS}Hz (100Hz/4 avg)'),
-            ('ADC', '12-bit'),
-        ]
-        for label, value in device_items:
-            ax.text(0.07, y, f'{label}:', fontsize=10, transform=ax.transAxes)
-            ax.text(0.35, y, value, fontsize=10, fontfamily='monospace', transform=ax.transAxes)
-            y -= 0.025
+        
+        # ECG Sample 2
+        if ecg_s2:
+            y -= 0.02
+            ax.text(0.05, y, 'ECG Sample 2 (Full Recording - Complete Analysis):', fontsize=13, fontweight='bold', transform=ax.transAxes, color='#2060a0')
+            y -= 0.03
+            hr2 = ecg_s2.get('heart_rate', {})
+            items = [
+                ('Duration', f'{ecg_s2["duration_sec"]:.1f}s'),
+                ('R-peaks', f'{len(ecg_s2.get("r_peaks", []))}'),
+                ('Analysis Type', 'Time + Freq + Nonlinear'),
+            ]
+            if hr2:
+                items.append(('Heart Rate', f'{hr2["mean"]:.1f} ± {hr2["std"]:.1f} bpm'))
+            hrv_freq = ecg_s2.get('hrv_freq', {})
+            if hrv_freq:
+                items.append(('Long-term HRV', '✓ Available'))
+            for label, value in items:
+                ax.text(0.07, y, f'{label}:', fontsize=10, transform=ax.transAxes)
+                ax.text(0.45, y, value, fontsize=10, fontfamily='monospace', transform=ax.transAxes)
+                y -= 0.025
+        
+        # PPG Sample 1
+        if ppg_s1:
+            y -= 0.02
+            ax.text(0.05, y, 'PPG Sample 1 (Full Recording - Basic Analysis):', fontsize=13, fontweight='bold', transform=ax.transAxes, color='#a02060')
+            y -= 0.03
+            items = [
+                ('Duration', f'{ppg_s1["duration_sec"]:.1f}s'),
+                ('IR Peaks', f'{len(ppg_s1.get("ir_peaks", []))}'),
+                ('Analysis Type', 'Time-domain only'),
+            ]
+            if ppg_s1.get('spo2'):
+                items.append(('SpO2', f'{ppg_s1["spo2"]}%'))
+            for label, value in items:
+                ax.text(0.07, y, f'{label}:', fontsize=10, transform=ax.transAxes)
+                ax.text(0.45, y, value, fontsize=10, fontfamily='monospace', transform=ax.transAxes)
+                y -= 0.025
+        
+        # PPG Sample 2
+        if ppg_s2:
+            y -= 0.02
+            ax.text(0.05, y, 'PPG Sample 2 (Full Recording - Complete Analysis):', fontsize=13, fontweight='bold', transform=ax.transAxes, color='#a02060')
+            y -= 0.03
+            items = [
+                ('Duration', f'{ppg_s2["duration_sec"]:.1f}s'),
+                ('IR Peaks', f'{len(ppg_s2.get("ir_peaks", []))}'),
+                ('Analysis Type', 'Time + Freq + Nonlinear'),
+            ]
+            if ppg_s2.get('spo2'):
+                items.append(('SpO2', f'{ppg_s2["spo2"]}%'))
+            prv_freq = ppg_s2.get('prv_freq', {})
+            if prv_freq:
+                items.append(('Long-term PRV', '✓ Available'))
+            for label, value in items:
+                ax.text(0.07, y, f'{label}:', fontsize=10, transform=ax.transAxes)
+                ax.text(0.45, y, value, fontsize=10, fontfamily='monospace', transform=ax.transAxes)
+                y -= 0.025
 
         pdf.savefig(fig, bbox_inches='tight')
         plt.close(fig)
 
     def _page_explanations(self, pdf, plt, ecg_result, ppg_result):
+        # [Same as before - metric explanations]
         fig = plt.figure(figsize=(11, 8.5))
         ax = fig.add_subplot(111)
         ax.axis('off')
         ax.text(0.5, 0.97, 'Understanding Your Results', fontsize=18, fontweight='bold', ha='center', transform=ax.transAxes)
-        ax.text(0.5, 0.94, '(Simple explanations of each measurement)', fontsize=11, ha='center',
-               transform=ax.transAxes, style='italic', color='gray')
 
         metrics_present = set()
         metrics_present.update(ecg_result.get('hrv_time', {}).keys())
         metrics_present.update(ecg_result.get('hrv_freq', {}).keys())
-        metrics_present.update(ecg_result.get('hrv_nonlinear', {}).keys())
-        metrics_present.update(ecg_result.get('intervals', {}).keys())
         if ppg_result:
             if ppg_result.get('spo2'):
                 metrics_present.add('SpO2')
-            if ppg_result.get('perfusion_index'):
-                metrics_present.add('Perfusion_Index')
-            if ppg_result.get('heart_rate'):
-                metrics_present.add('PPG_HR')
             metrics_present.update(ppg_result.get('prv_time', {}).keys())
 
-        priority = ['SpO2', 'Perfusion_Index', 'PPG_HR', 'HRV_MeanNN', 'HRV_SDNN', 'HRV_RMSSD', 
-                   'HRV_pNN50', 'HRV_LF', 'HRV_HF', 'HRV_LFHF', 'HRV_SD1', 'HRV_SD2',
-                   'HRV_ApEn', 'HRV_DFA_alpha1', 'PR_Interval', 'QRS_Duration', 'QTc',
-                   'PRV_SDNN', 'PRV_RMSSD']
-        
         y = 0.88
         count = 0
-        for key in priority:
-            if key in metrics_present and key in METRIC_EXPLANATIONS and count < 16:
+        for key in ['SpO2', 'HRV_SDNN', 'HRV_RMSSD', 'HRV_LFHF', 'HRV_DFA_alpha1', 'PRV_SDNN']:
+            if key in metrics_present and key in METRIC_EXPLANATIONS and count < 12:
                 name, explanation = METRIC_EXPLANATIONS[key]
                 ax.text(0.03, y, f'• {name}:', fontsize=10, fontweight='bold', transform=ax.transAxes)
                 y -= 0.022
-                
-                if len(explanation) > 90:
-                    explanation = explanation[:87] + '...'
-                ax.text(0.05, y, explanation, fontsize=9, transform=ax.transAxes, color='#333333')
+                ax.text(0.05, y, explanation[:85], fontsize=9, transform=ax.transAxes, color='#333333')
                 y -= 0.035
                 count += 1
-                
-                if y < 0.08:
-                    break
-
-        y -= 0.02
-        ax.text(0.5, y, 'Note: These are for informational purposes only. Consult a healthcare professional for medical advice.',
-               fontsize=9, ha='center', transform=ax.transAxes, style='italic', color='#666666')
 
         pdf.savefig(fig, bbox_inches='tight')
         plt.close(fig)
@@ -1868,7 +2335,7 @@ class SessionDialog(QDialog):
 class NirogScanGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("NirogScan v4.2")
+        self.setWindowTitle("NirogScan v4.3 - Dual Sample Analysis")
         self.setGeometry(100, 100, 1400, 800)
         self.setStyleSheet(DARK_STYLE)
 
@@ -2000,7 +2467,7 @@ class NirogScanGUI(QMainWindow):
 
         self.statusBar = QStatusBar()
         self.setStatusBar(self.statusBar)
-        self.statusBar.showMessage("Ready")
+        self.statusBar.showMessage("Ready - Dual Sample Analysis Mode")
 
     def _connect_signals(self):
         self.signals.new_packet.connect(self._on_packet)
