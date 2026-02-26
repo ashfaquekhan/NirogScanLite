@@ -1,7 +1,0 @@
-Name: ashf
-Age: 24
-Gender: Male
-Weight: N/A
-Height: 0
-Diseases: None
-Recording Started: 2026-02-03 17:39:20
