@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""
-NirogScan v5.0 Fixed - Enhanced ECG/PPG Analysis
-Features:
-- ECG: Medical grid plots, PQRST detection & labeling, interval analysis
-- PPG: Age Index, PAT, Respiration Rate, Baseline Shift
-- Proper NeuroKit2 integration
-- Fixed logging (no zeros)
-"""
 
 import sys, os, asyncio, struct, time, queue, warnings
 from threading import Lock
