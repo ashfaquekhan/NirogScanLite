@@ -47,6 +47,11 @@ except ImportError as e:
     print(f"[INIT] WARNING: NeuroKit2 not available: {e}")
 
 # ============================================================================
+# NEW FLAG FOR PPG DELINEATION (v5.5 addition)
+# ============================================================================
+HAS_PPG_DELINEATE = hasattr(nk, 'ppg_delineate') if NEUROKIT_AVAILABLE else False
+
+# ============================================================================
 # CONSTANTS
 # ============================================================================
 
@@ -68,6 +73,9 @@ PPG_EFFECTIVE_FS = 100
 
 MIN_RPEAKS_REQUIRED = 5
 MIN_RPEAKS = MIN_RPEAKS_REQUIRED  # alias for old code compatibility
+
+# NEW CONSTANT FOR PPG PEAKS (v5.5 addition)
+MIN_PPG_PEAKS = 5
 
 SPO2_LOOKUP = [
     95, 95, 95, 96, 96, 96, 97, 97, 97, 97, 97, 98, 98, 98, 98, 98,
@@ -180,11 +188,25 @@ def bandpass_filter(signal: np.ndarray, lowcut: float, highcut: float, fs: int, 
     return filtfilt(b, a, signal, padlen=min(len(signal)-1, 3*max(len(a), len(b))))
 
 
-def lowpass_filter(signal: np.ndarray, cutoff: float, fs: int, order: int = 4) -> np.ndarray:
+# MODIFIED: lowpass filter now uses order 2 (from v5.5) instead of order 4
+def lowpass_filter(signal: np.ndarray, cutoff: float, fs: int, order: int = 2) -> np.ndarray:
     nyq = fs / 2.0
     normalized_cutoff = min(0.999, cutoff / nyq)
     b, a = butter(order, normalized_cutoff, btype='low')
     return filtfilt(b, a, signal, padlen=min(len(signal)-1, 3*max(len(a), len(b))))
+
+
+# ============================================================================
+# NEW ROBUST PPG PEAK DETECTION (from v5.5)
+# ============================================================================
+def robust_ppg_peaks(signal, fs):
+    """Detect peaks in PPG signal, trying both polarities."""
+    min_dist = int(0.3 * fs)
+    prom = (np.percentile(signal, 95) - np.percentile(signal, 5)) * 0.1
+    peaks, _ = scipy_find_peaks(signal, distance=min_dist, prominence=prom)
+    if len(peaks) < 3:
+        peaks, _ = scipy_find_peaks(-signal, distance=min_dist, prominence=prom)
+    return np.array(peaks)
 
 
 # ============================================================================
@@ -512,7 +534,6 @@ class SignalQualityAnalyzer:
         print(f"[WINDOW] BEST: {best[0]/fs:.2f}s-{best[1]/fs:.2f}s, SNR: {best[2]:.1f}dB, R-peaks: {best[3]}")
         return best[0], best[1], best[2], best[3]
 
-    # Alias used by old code
     @staticmethod
     def find_best_ecg_window(ecg_data: np.ndarray, fs: int,
                               min_rpeaks: int = MIN_RPEAKS_REQUIRED,
@@ -523,7 +544,7 @@ class SignalQualityAnalyzer:
 
 
 # ============================================================================
-# PPG PREPROCESSOR
+# PPG PREPROCESSOR (unchanged – not used in report generation)
 # ============================================================================
 
 class PPGPreprocessor:
@@ -633,7 +654,7 @@ class PPGPreprocessor:
 
 
 # ============================================================================
-# SPO2 CALCULATOR
+# SPO2 CALCULATOR (unchanged – not used in report generation)
 # ============================================================================
 
 class SpO2Calculator:
@@ -705,7 +726,7 @@ class SpO2Calculator:
 
 
 # ============================================================================
-# ECG PROCESSOR
+# ECG PROCESSOR (unchanged)
 # ============================================================================
 
 class ECGProcessor:
@@ -907,7 +928,7 @@ class ECGProcessor:
 
 
 # ============================================================================
-# PPG PROCESSOR (new robust version)
+# PPG PROCESSOR (unchanged – not used in report generation)
 # ============================================================================
 
 class PPGProcessor:
@@ -1000,15 +1021,15 @@ class PPGProcessor:
 
 
 # ============================================================================
-# STANDALONE PPG PROCESSING (old version - with Age Index, Respiration, Baseline)
+# STANDALONE PPG PROCESSING (REPLACED WITH v5.5 VERSION)
 # ============================================================================
 
 def process_ppg(red_data, ir_data, fs, patient_height_m=1.70):
-    """Process PPG with Age Index, PAT, Respiration Rate"""
+    """Enhanced PPG processing with light filtering and robust peak detection (v5.5 version)"""
     print(f"\n{'='*70}")
     print(f"[PPG] Processing {len(ir_data)} samples @ {fs}Hz ({len(ir_data)/fs:.2f}s)")
     print(f"{'='*70}")
-    
+
     result = {
         'red_raw': red_data,
         'ir_raw': ir_data,
@@ -1016,60 +1037,56 @@ def process_ppg(red_data, ir_data, fs, patient_height_m=1.70):
         'ir_filtered': None,
         'red_peaks': np.array([]),
         'ir_peaks': np.array([]),
+        'red_features': {},
+        'ir_features': {},
         'heart_rate': None,
         'spo2': None,
         'perfusion_index': None,
         'age_index': None,
         'respiration_rate': None,
-        'baseline_shift': {},
+        'baseline_shift_ir': {},
+        'baseline_shift_red': {},
+        'baseline_ir': None,
+        'baseline_red': None,
+        'pat': None,
     }
-    
-    # Preprocess IR
-    ir_signal = np.array(ir_data, dtype=np.float64)
-    ir_dc_removed = ir_signal - np.mean(ir_signal)
-    ir_detrended = detrend(ir_dc_removed)
-    ir_filtered = bandpass_filter(ir_detrended, 0.5, 8.0, fs, order=3)
-    ir_normalized = (ir_filtered - np.mean(ir_filtered)) / (np.std(ir_filtered) + 1e-10)
+
+    # Light lowpass only (preserve baseline, remove high-frequency noise)
+    ir_filtered = lowpass_filter(ir_data, 5.0, fs, order=2)
+    red_filtered = lowpass_filter(red_data, 5.0, fs, order=2)
     result['ir_filtered'] = ir_filtered
-    
-    # Preprocess Red
-    red_signal = np.array(red_data, dtype=np.float64)
-    red_dc_removed = red_signal - np.mean(red_signal)
-    red_detrended = detrend(red_dc_removed)
-    red_filtered = bandpass_filter(red_detrended, 0.5, 8.0, fs, order=3)
-    red_normalized = (red_filtered - np.mean(red_filtered)) / (np.std(red_filtered) + 1e-10)
     result['red_filtered'] = red_filtered
-    
-    # Find peaks
+
+    # --- Robust peak detection ---
+    ir_peaks = np.array([])
+    red_peaks = np.array([])
     if NEUROKIT_AVAILABLE:
         try:
-            peaks_info = nk.ppg_findpeaks(ir_normalized, sampling_rate=fs)
+            peaks_info = nk.ppg_findpeaks(ir_filtered, sampling_rate=fs)
             ir_peaks = np.array(peaks_info.get('PPG_Peaks', []))
-            result['ir_peaks'] = ir_peaks
-            print(f"[PPG] IR peaks: {len(ir_peaks)}")
         except:
-            ir_peaks = np.array([])
-    else:
-        ir_peaks = np.array([])
-    
-    if NEUROKIT_AVAILABLE:
+            pass
         try:
-            peaks_info = nk.ppg_findpeaks(red_normalized, sampling_rate=fs)
+            peaks_info = nk.ppg_findpeaks(red_filtered, sampling_rate=fs)
             red_peaks = np.array(peaks_info.get('PPG_Peaks', []))
-            result['red_peaks'] = red_peaks
-            print(f"[PPG] Red peaks: {len(red_peaks)}")
         except:
-            red_peaks = np.array([])
-    else:
-        red_peaks = np.array([])
-    
+            pass
+
+    if len(ir_peaks) < MIN_PPG_PEAKS:
+        ir_peaks = robust_ppg_peaks(ir_filtered, fs)
+    if len(red_peaks) < MIN_PPG_PEAKS:
+        red_peaks = robust_ppg_peaks(red_filtered, fs)
+
+    result['ir_peaks'] = ir_peaks
+    result['red_peaks'] = red_peaks
+    print(f"[PPG] IR peaks: {len(ir_peaks)}, Red peaks: {len(red_peaks)}")
+
     # Heart rate from peaks
     peaks = ir_peaks if len(ir_peaks) >= len(red_peaks) else red_peaks
     if len(peaks) >= 2:
         pp_samples = np.diff(peaks)
         pp_ms = pp_samples / fs * 1000
         pp_valid = pp_ms[(pp_ms > 300) & (pp_ms < 2000)]
-        
         if len(pp_valid) > 0:
             hr_bpm = 60000 / pp_valid
             result['heart_rate'] = {
@@ -1078,39 +1095,43 @@ def process_ppg(red_data, ir_data, fs, patient_height_m=1.70):
                 'min': float(np.min(hr_bpm)),
                 'max': float(np.max(hr_bpm)),
             }
-            print(f"[PPG] HR: {result['heart_rate']['mean']:.1f} +/- {result['heart_rate']['std']:.1f} bpm")
-    
-    # SpO2
+            print(f"[PPG] HR: {result['heart_rate']['mean']:.1f} ± {result['heart_rate']['std']:.1f} bpm")
+
+    # SpO2 calculation
     if len(ir_peaks) >= 3 and len(red_peaks) >= 3:
         r_ratios = []
-        for i in range(min(len(ir_peaks), len(red_peaks)) - 1):
-            start_idx = max(ir_peaks[i], red_peaks[i])
-            end_idx = min(ir_peaks[i + 1], red_peaks[i + 1]) if i + 1 < min(len(ir_peaks), len(red_peaks)) else len(red_data)
-            
-            if end_idx - start_idx < 3 or end_idx >= len(red_data):
+        for ir_p in ir_peaks:
+            diffs = np.abs(red_peaks - ir_p)
+            if len(diffs) == 0:
                 continue
-            
-            red_segment = red_data[start_idx:end_idx]
-            ir_segment = ir_data[start_idx:end_idx]
-            
-            red_dc = np.mean(red_segment)
-            ir_dc = np.mean(ir_segment)
-            
+            nearest_idx = np.argmin(diffs)
+            red_p = red_peaks[nearest_idx]
+            if abs(red_p - ir_p) > 0.5 * fs:
+                continue
+
+            start = max(0, min(ir_p, red_p) - int(0.2*fs))
+            end = min(len(ir_data), max(ir_p, red_p) + int(0.2*fs))
+            if end - start < 3:
+                continue
+
+            red_seg = red_data[start:end]
+            ir_seg = ir_data[start:end]
+
+            red_dc = np.mean(red_seg)
+            ir_dc = np.mean(ir_seg)
             if red_dc <= 0 or ir_dc <= 0:
                 continue
-            
-            red_ac = np.max(red_segment) - np.min(red_segment)
-            ir_ac = np.max(ir_segment) - np.min(ir_segment)
-            
+
+            red_ac = np.max(red_seg) - np.min(red_seg)
+            ir_ac = np.max(ir_seg) - np.min(ir_seg)
             if ir_ac <= 0 or ir_dc <= 0:
                 continue
-            
+
             r_ratio = (red_ac / red_dc) / (ir_ac / ir_dc)
-            
             if 0.2 < r_ratio < 2.0:
                 r_ratios.append(r_ratio)
-        
-        if len(r_ratios) >= 2:
+
+        if len(r_ratios) >= 3:
             r_avg = np.mean(r_ratios)
             lookup_index = int(r_avg * 100)
             if 0 <= lookup_index < len(SPO2_LOOKUP):
@@ -1118,124 +1139,108 @@ def process_ppg(red_data, ir_data, fs, patient_height_m=1.70):
             else:
                 result['spo2'] = max(0, min(100, int(-45.060 * r_avg * r_avg + 30.354 * r_avg + 94.845)))
             print(f"[PPG] SpO2: {result['spo2']}%")
-            
+
             # Perfusion Index
             ir_dc = np.mean(ir_data)
             ir_ac = np.max(ir_data) - np.min(ir_data)
             if ir_dc > 0:
                 result['perfusion_index'] = (ir_ac / ir_dc) * 100
                 print(f"[PPG] PI: {result['perfusion_index']:.2f}%")
-    
-    # Age Index (Stiffness Index)
-    if len(ir_peaks) >= 3:
+
+    # Age Index (requires NeuroKit2 delineation)
+    if NEUROKIT_AVAILABLE and HAS_PPG_DELINEATE and len(ir_peaks) >= 3:
         try:
-            delta_t_values = []
-            for i in range(len(ir_peaks) - 1):
-                peak_idx = ir_peaks[i]
-                next_peak_idx = ir_peaks[i + 1]
-                
-                # Search for dicrotic notch between peaks
-                search_start = peak_idx + int(0.12 * fs)  # 120ms after peak
-                search_end = min(peak_idx + int(0.35 * fs), next_peak_idx)  # Up to 350ms
-                
-                if search_end > search_start and search_end < len(ir_normalized):
-                    segment = ir_normalized[search_start:search_end]
-                    notch_idx_rel = np.argmin(segment)
-                    notch_idx = search_start + notch_idx_rel
-                    
-                    delta_t = (notch_idx - peak_idx) / fs  # seconds
-                    
-                    if 0.1 < delta_t < 0.35:  # Physiological range
-                        delta_t_values.append(delta_t)
-            
-            if len(delta_t_values) >= 2:
-                avg_delta_t = np.mean(delta_t_values)
-                age_index = patient_height_m / avg_delta_t  # m/s
-                result['age_index'] = age_index
-                print(f"[PPG] Age Index: {age_index:.2f} m/s (dt={avg_delta_t*1000:.1f}ms)")
+            _, waves_ir = nk.ppg_delineate(ir_filtered, ir_peaks, sampling_rate=fs)
+            result['ir_features'] = waves_ir
+            if 'PPG_Dicrotic_Notch' in waves_ir:
+                dicrotic = np.array(waves_ir['PPG_Dicrotic_Notch'])
+                valid_mask = ~np.isnan(dicrotic)
+                dicrotic = dicrotic[valid_mask]
+                peaks_valid = ir_peaks[valid_mask]
+                delta_t_values = []
+                for i in range(len(peaks_valid)):
+                    if i < len(dicrotic) and not np.isnan(dicrotic[i]):
+                        delta_t = (dicrotic[i] - peaks_valid[i]) / fs
+                        if 0.1 < delta_t < 0.35:
+                            delta_t_values.append(delta_t)
+                if len(delta_t_values) >= 2:
+                    avg_delta_t = np.mean(delta_t_values)
+                    age_index = patient_height_m / avg_delta_t
+                    result['age_index'] = age_index
+                    print(f"[PPG] Age Index: {age_index:.2f} m/s")
         except Exception as e:
             print(f"[PPG] Age Index failed: {e}")
-    
+    else:
+        if NEUROKIT_AVAILABLE and not HAS_PPG_DELINEATE:
+            print("[PPG] Age Index: ppg_delineate not available in this NeuroKit2 version")
+
     # Respiration Rate
-    if len(ir_data) >= fs * 30:  # Need at least 30 seconds
+    if len(ir_data) >= fs * 30:
         try:
-            # Extract envelope using Hilbert transform
             analytic_signal = hilbert(ir_filtered)
             amplitude_envelope = np.abs(analytic_signal)
-            
-            # Bandpass filter envelope for respiratory frequencies (0.1-0.5 Hz = 6-30 bpm)
-            resp_signal = bandpass_filter(amplitude_envelope, 0.1, 0.5, fs, order=2)
-            
-            # Find peaks in respiratory signal
-            min_distance = int(2.0 * fs)  # Min 2 seconds between breaths
+            resp_signal = lowpass_filter(amplitude_envelope, 0.5, fs, order=2)
+            min_distance = int(2.0 * fs)
             peaks, _ = scipy_find_peaks(resp_signal, distance=min_distance)
-            
             if len(peaks) >= 3:
-                breath_intervals = np.diff(peaks) / fs  # seconds
-                breath_rate = 60.0 / np.mean(breath_intervals)  # breaths per minute
-                
-                if 5 < breath_rate < 40:  # Physiological range
+                breath_intervals = np.diff(peaks) / fs
+                breath_rate = 60.0 / np.mean(breath_intervals)
+                if 5 < breath_rate < 40:
                     result['respiration_rate'] = breath_rate
                     print(f"[PPG] Respiration: {breath_rate:.1f} breaths/min")
         except Exception as e:
             print(f"[PPG] Respiration failed: {e}")
-    
-    # Baseline Shift Analysis and Tracking
+
+    # Baseline Shift (with robust polyfit)
     try:
-        # Linear trend for IR
-        x = np.arange(len(ir_filtered))
-        coeffs_ir = np.polyfit(x, ir_filtered, 1)
-        drift_per_sample_ir = coeffs_ir[0]
-        drift_per_sec_ir = drift_per_sample_ir * fs
-        trend_line_ir = np.polyval(coeffs_ir, x)
-        detrended_sig_ir = ir_filtered - trend_line_ir
-        std_dev_ir = np.std(detrended_sig_ir)
-        drift_magnitude_ir = np.max(ir_filtered) - np.min(ir_filtered)
-        result['baseline_ir'] = trend_line_ir
-
-        # Linear trend for Red
-        coeffs_red = np.polyfit(x, red_filtered, 1)
-        drift_per_sample_red = coeffs_red[0]
-        drift_per_sec_red = drift_per_sample_red * fs
-        trend_line_red = np.polyval(coeffs_red, x)
-        detrended_sig_red = red_filtered - trend_line_red
-        std_dev_red = np.std(detrended_sig_red)
-        drift_magnitude_red = np.max(red_filtered) - np.min(red_filtered)
-        result['baseline_red'] = trend_line_red
-
-        result['baseline_shift'] = {
-            'drift_per_sec_ir': drift_per_sec_ir,
-            'std_deviation_ir': std_dev_ir,
-            'drift_magnitude_ir': drift_magnitude_ir,
-            'drift_per_sec_red': drift_per_sec_red,
-            'std_deviation_red': std_dev_red,
-            'drift_magnitude_red': drift_magnitude_red,
-        }
-        print(f"[PPG] Baseline IR: drift={drift_per_sec_ir:.3f}/s, std={std_dev_ir:.2f}")
-        print(f"[PPG] Baseline Red: drift={drift_per_sec_red:.3f}/s, std={std_dev_red:.2f}")
+        for channel, filt in [('ir', ir_filtered), ('red', red_filtered)]:
+            x = np.arange(len(filt))
+            if len(filt) >= 2:
+                coeffs = np.polyfit(x, filt, 1)
+                drift_per_sample = coeffs[0]
+                drift_per_sec = drift_per_sample * fs
+                trend_line = np.polyval(coeffs, x)
+                detrended_sig = filt - trend_line
+                std_dev = np.std(detrended_sig)
+                drift_magnitude = np.max(filt) - np.min(filt)
+                result[f'baseline_shift_{channel}'] = {
+                    'drift_per_sec': drift_per_sec,
+                    'std_deviation': std_dev,
+                    'drift_magnitude': drift_magnitude,
+                }
+                # Store the trend line for plotting (used by report generator)
+                result[f'baseline_{channel}'] = trend_line
+            else:
+                result[f'baseline_shift_{channel}'] = {
+                    'drift_per_sec': 0.0,
+                    'std_deviation': 0.0,
+                    'drift_magnitude': 0.0,
+                }
+                result[f'baseline_{channel}'] = np.zeros_like(filt)
+        print(f"[PPG] Baseline IR: drift={result['baseline_shift_ir']['drift_per_sec']:.3f}/s, std={result['baseline_shift_ir']['std_deviation']:.2f}")
+        print(f"[PPG] Baseline Red: drift={result['baseline_shift_red']['drift_per_sec']:.3f}/s, std={result['baseline_shift_red']['std_deviation']:.2f}")
     except Exception as e:
         print(f"[PPG] Baseline analysis failed: {e}")
-    
+
     return result
+
 
 def calculate_pat(ecg_r_peaks, ppg_peaks, ecg_fs, ppg_fs):
     """Calculate Pulse Arrival Time"""
     if len(ecg_r_peaks) < 2 or len(ppg_peaks) < 2:
         return None
 
-    # Convert peak indices to time
     ecg_times = ecg_r_peaks / ecg_fs
     ppg_times = ppg_peaks / ppg_fs
 
     pat_values = []
     ppg_idx = 0
     for r_time in ecg_times:
-        # Find the first PPG peak after this R-peak
         while ppg_idx < len(ppg_times) and ppg_times[ppg_idx] < r_time:
             ppg_idx += 1
         if ppg_idx < len(ppg_times):
-            pat = (ppg_times[ppg_idx] - r_time) * 1000.0  # ms
-            if 50 < pat < 500:  # physiologically plausible
+            pat = (ppg_times[ppg_idx] - r_time) * 1000.0
+            if 50 < pat < 500:
                 pat_values.append(pat)
 
     if len(pat_values) >= 2:
@@ -1247,12 +1252,80 @@ def calculate_pat(ecg_r_peaks, ppg_peaks, ecg_fs, ppg_fs):
 
 
 # ============================================================================
-# REPORT GENERATOR
+# REPORT GENERATOR (unchanged except it now uses the new process_ppg)
 # ============================================================================
 
 class ReportGenerator(QThread):
+
     finished = pyqtSignal(bool, str)
     progress = pyqtSignal(str)
+
+    def _page_summary(self, pdf, plt, ecg_result, ecg_result2, ppg_result, ppg_result2, snr):
+        """Summary page"""
+        fig, ax = plt.subplots(figsize=(11, 8.5))
+        ax.axis('off')
+        ax.text(0.5, 0.97, 'Analysis Summary', fontsize=18, fontweight='bold', 
+            ha='center', transform=ax.transAxes)
+        y = 0.88
+        # ECG
+        ax.text(0.05, y, 'ECG Analysis:', fontsize=13, fontweight='bold', 
+            transform=ax.transAxes, color='#2060a0')
+        y -= 0.03
+        if ecg_result is None:
+            ax.text(0.07, y, 'No ECG data available.', fontsize=10, transform=ax.transAxes, color='red')
+            y -= 0.03
+        else:
+            hr = ecg_result.get('heart_rate') if ecg_result is not None else None
+            if hr:
+                ax.text(0.07, y, 'Heart Rate:', fontsize=10, transform=ax.transAxes)
+                ax.text(0.35, y, f'{hr["mean"]:.1f} ± {hr["std"]:.1f} bpm', fontsize=10, 
+                    fontfamily='monospace', transform=ax.transAxes)
+                y -= 0.025
+            intervals = ecg_result.get('intervals', {}) if ecg_result is not None else {}
+            for k in ['PR_Interval', 'QRS_Duration', 'QTc']:
+                if k in intervals:
+                    ax.text(0.07, y, f'{k.replace("_", " ")}:', fontsize=10, transform=ax.transAxes)
+                    ax.text(0.35, y, f'{intervals[k]:.0f} ms', fontsize=10, 
+                        fontfamily='monospace', transform=ax.transAxes)
+                    y -= 0.025
+            hrv = ecg_result.get('hrv', {}) if ecg_result is not None else {}
+            for k in ['HRV_SDNN', 'HRV_RMSSD']:
+                if k in hrv:
+                    ax.text(0.07, y, f'{k}:', fontsize=10, transform=ax.transAxes)
+                    ax.text(0.35, y, f'{hrv[k]:.1f}', fontsize=10, 
+                        fontfamily='monospace', transform=ax.transAxes)
+                    y -= 0.025
+        # PPG
+        if ppg_result:
+            y -= 0.02
+            ax.text(0.05, y, 'PPG Analysis:', fontsize=13, fontweight='bold', 
+                transform=ax.transAxes, color='#a02060')
+            y -= 0.03
+            if ppg_result.get('spo2'):
+                ax.text(0.07, y, 'SpO2:', fontsize=10, transform=ax.transAxes)
+                ax.text(0.35, y, f'{ppg_result["spo2"]}%', fontsize=10, 
+                    fontfamily='monospace', transform=ax.transAxes)
+                y -= 0.025
+            if ppg_result.get('age_index'):
+                ax.text(0.07, y, 'Age Index:', fontsize=10, transform=ax.transAxes)
+                ax.text(0.35, y, f'{ppg_result["age_index"]:.2f} m/s', fontsize=10, 
+                    fontfamily='monospace', transform=ax.transAxes)
+                y -= 0.025
+            if ppg_result.get('pat'):
+                ax.text(0.07, y, 'PAT:', fontsize=10, transform=ax.transAxes)
+                ax.text(0.35, y, f'{ppg_result["pat"]:.1f} ms', fontsize=10, 
+                    fontfamily='monospace', transform=ax.transAxes)
+                y -= 0.025
+            if ppg_result.get('respiration_rate'):
+                ax.text(0.07, y, 'Respiration:', fontsize=10, transform=ax.transAxes)
+                ax.text(0.35, y, f'{ppg_result["respiration_rate"]:.1f} br/min', fontsize=10, 
+                    fontfamily='monospace', transform=ax.transAxes)
+                y -= 0.025
+        y -= 0.03
+        ax.text(0.5, y, 'Note: For informational purposes only. Consult healthcare professional for medical advice.',
+            fontsize=9, ha='center', transform=ax.transAxes, style='italic', color='#666666')
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close(fig)
 
     def __init__(self, session_dir: str, output_path: str):
         super().__init__()
@@ -1298,7 +1371,7 @@ class ReportGenerator(QThread):
                 self.progress.emit("Analyzing ECG Sample 2 (Full Recording - Long-term)...")
                 ecg_result2 = ecg_processor.process(self.ecg_data)
 
-            # PPG Analysis
+            # PPG Analysis (uses the new process_ppg function)
             ppg_result1 = None
             ppg_result2 = None
             if self.ppg_ir_data is not None and self.ppg_red_data is not None:
@@ -1319,7 +1392,6 @@ class ReportGenerator(QThread):
                     if ecg_result1.get('r_peaks') is not None and len(ecg_result1['r_peaks']) >= 2:
                         ppg_peaks = ppg_result1.get('ir_peaks', np.array([]))
                         if len(ppg_peaks) >= 2:
-                            # Adjust ECG r_peaks to full recording offset
                             r_peaks_full = ecg_result1['r_peaks'] + start1
                             ppg_result1['pat'] = calculate_pat(
                                 r_peaks_full, ppg_peaks, ECG_FS, PPG_FS)
@@ -1814,7 +1886,7 @@ class ReportGenerator(QThread):
         plt.close(fig)
 
     # ------------------------------------------------------------------
-    # PPG SIGNALS PAGE
+    # PPG SIGNALS PAGE (unchanged – uses baseline_ir and baseline_red)
     # ------------------------------------------------------------------
     def _page_ppg_signals(self, pdf, plt, ppg_result):
         """PPG signals with peaks labeled and baseline tracking"""
@@ -1883,6 +1955,7 @@ class ReportGenerator(QThread):
 
     def _page_ppg_analysis(self, pdf, plt, ppg_result):
         """PPG analysis: SpO2, Age Index, PAT, Respiration, Frequency, Segmentation"""
+        import neurokit2 as nk
         fig = plt.figure(figsize=(15, 12))
         fig.suptitle('PPG Advanced Analysis', fontsize=16, fontweight='bold')
         gs = self.gridspec.GridSpec(3, 3, figure=fig)
@@ -1998,103 +2071,17 @@ class ReportGenerator(QThread):
         ax = fig.add_subplot(gs[2, 2])
         ax.axis('off')
         ax.text(0.5, 0.95, 'Baseline Tracking', fontsize=12, fontweight='bold', ha='center', transform=ax.transAxes)
-        bs = ppg_result.get('baseline_shift', {})
+        bs = ppg_result.get('baseline_shift_ir', {})
         txt = ''
         if bs:
-            txt += f"IR Drift: {bs.get('drift_per_sec_ir', 0):.3f}/s\nIR Std: {bs.get('std_deviation_ir', 0):.2f}\n"
-            txt += f"Red Drift: {bs.get('drift_per_sec_red', 0):.3f}/s\nRed Std: {bs.get('std_deviation_red', 0):.2f}"
+            txt += f"IR Drift: {bs.get('drift_per_sec', 0):.3f}/s\nIR Std: {bs.get('std_deviation', 0):.2f}\n"
+            bs = ppg_result.get('baseline_shift_red', {})
+            txt += f"Red Drift: {bs.get('drift_per_sec', 0):.3f}/s\nRed Std: {bs.get('std_deviation', 0):.2f}"
         else:
             txt = 'Not available'
         ax.text(0.5, 0.5, txt, ha='center', va='center', transform=ax.transAxes, fontsize=12)
 
         plt.tight_layout()
-        pdf.savefig(fig, bbox_inches='tight')
-        plt.close(fig)
-
-    # ------------------------------------------------------------------
-    # SUMMARY PAGE
-    # ------------------------------------------------------------------
-    def _page_summary(self, pdf, plt, ecg_result1, ecg_result2,
-                      ppg_result1, ppg_result2, snr):
-        fig, ax = plt.subplots(figsize=(11, 8.5))
-        ax.axis('off')
-        ax.text(0.5, 0.97, 'Analysis Summary', fontsize=18, fontweight='bold',
-                ha='center', transform=ax.transAxes)
-
-        y = 0.90
-        ax.text(0.05, y, 'ECG Results:', fontsize=13, fontweight='bold',
-                transform=ax.transAxes, color='#2060a0')
-        y -= 0.03
-
-        ecg_items = [('Signal SNR', f'{snr:.1f} dB')]
-        hr = ecg_result1.get('heart_rate')
-        if hr:
-            ecg_items.append(('Heart Rate', f'{hr["mean"]:.1f} +/- {hr["std"]:.1f} bpm'))
-        intervals = ecg_result1.get('intervals', {})
-        for k in ['PR_Interval', 'QRS_Duration', 'QTc']:
-            if k in intervals:
-                ecg_items.append((k.replace('_', ' '), f'{intervals[k]:.0f} ms'))
-        hrv_t = ecg_result1.get('hrv_time', {})
-        for k in ['HRV_SDNN', 'HRV_RMSSD']:
-            if k in hrv_t:
-                ecg_items.append((k.replace('HRV_', ''), f'{hrv_t[k]:.1f} ms'))
-
-        # If long-term analysis available, add note
-        if ecg_result2:
-            ecg_items.append(('Long-term recording', f'{len(self.ecg_data)/ECG_FS:.1f}s analysed'))
-            hrv2 = ecg_result2.get('hrv_freq', {})
-            for k in ['HRV_LF', 'HRV_HF', 'HRV_LFHF']:
-                if k in hrv2:
-                    ecg_items.append((k.replace('HRV_', 'LT '), f'{hrv2[k]:.2f}'))
-
-        for label, value in ecg_items:
-            ax.text(0.07, y, f'{label}:', fontsize=10, transform=ax.transAxes)
-            ax.text(0.38, y, value, fontsize=10, fontfamily='monospace',
-                    transform=ax.transAxes)
-            y -= 0.025
-
-        if ppg_result1:
-            y -= 0.02
-            ax.text(0.05, y, 'PPG Results:', fontsize=13, fontweight='bold',
-                    transform=ax.transAxes, color='#a02060')
-            y -= 0.03
-            ppg_items = []
-            if ppg_result1.get('spo2'):
-                ppg_items.append(('SpO2', f'{ppg_result1["spo2"]}%'))
-            if ppg_result1.get('perfusion_index'):
-                ppg_items.append(('Perfusion Index', f'{ppg_result1["perfusion_index"]:.2f}%'))
-            ppg_hr = ppg_result1.get('heart_rate')
-            if ppg_hr:
-                ppg_items.append(('Pulse Rate', f'{ppg_hr["mean"]:.1f} +/- {ppg_hr["std"]:.1f} bpm'))
-            if ppg_result1.get('age_index'):
-                ppg_items.append(('Age Index', f'{ppg_result1["age_index"]:.2f} m/s'))
-            if ppg_result1.get('pat'):
-                ppg_items.append(('PAT', f'{ppg_result1["pat"]:.1f} ms'))
-            if ppg_result1.get('respiration_rate'):
-                ppg_items.append(('Respiration', f'{ppg_result1["respiration_rate"]:.1f} br/min'))
-            for label, value in ppg_items:
-                ax.text(0.07, y, f'{label}:', fontsize=10, transform=ax.transAxes)
-                ax.text(0.38, y, value, fontsize=10, fontfamily='monospace',
-                        transform=ax.transAxes)
-                y -= 0.025
-
-        y -= 0.03
-        ax.text(0.05, y, 'Device:', fontsize=12, fontweight='bold',
-                transform=ax.transAxes, color='#206020')
-        y -= 0.03
-        for label, value in [('ECG', f'AD8232 @ {ECG_FS}Hz'),
-                              ('PPG', f'MAX30102 @ {PPG_FS}Hz'),
-                              ('ADC', '12-bit')]:
-            ax.text(0.07, y, f'{label}:', fontsize=10, transform=ax.transAxes)
-            ax.text(0.38, y, value, fontsize=10, fontfamily='monospace',
-                    transform=ax.transAxes)
-            y -= 0.025
-
-        y -= 0.02
-        ax.text(0.5, y,
-                'Note: For informational purposes only. Consult a healthcare professional for medical advice.',
-                fontsize=9, ha='center', transform=ax.transAxes, style='italic', color='#666666')
-
         pdf.savefig(fig, bbox_inches='tight')
         plt.close(fig)
 
@@ -2278,7 +2265,7 @@ class SessionDialog(QDialog):
 class NirogScanGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("NirogScan v4.3")
+        self.setWindowTitle("NirogScan v4.3 (PPG Updated)")
         self.setGeometry(100, 100, 1400, 800)
         self.setStyleSheet(DARK_STYLE)
 
