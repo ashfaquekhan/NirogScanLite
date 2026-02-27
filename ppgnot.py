@@ -50,7 +50,7 @@ ADC_MAX_VALUE = 4095
 AD8232_GAIN = 1100
 
 ECG_FS = 125
-PPG_FS = 25
+PPG_FS = 50                # Fixed: 2 samples per packet at 25 packets/sec
 
 MIN_RPEAKS = 5
 
@@ -341,118 +341,114 @@ class LogThread(QThread):
 # ANALYSIS FUNCTIONS
 # ============================================================================
 
-class SignalQualityAnalyzer:
-    @staticmethod
-    def calculate_snr(signal: np.ndarray, fs: int) -> float:
-        if len(signal) < fs:
-            return float('-inf')
-        try:
-            signal = np.array(signal, dtype=np.float64)
-            signal = signal - np.mean(signal)
-            filtered = bandpass_filter(signal, 0.5, 40.0, fs)
-            signal_power = np.var(filtered)
-            noise = signal - filtered
-            noise_power = np.var(noise)
-            if noise_power < 1e-10:
-                return 50.0
-            return 10 * np.log10(signal_power / noise_power)
-        except Exception:
-            return float('-inf')
+def calculate_snr(signal, fs):
+    """Calculate Signal-to-Noise Ratio"""
+    if len(signal) < fs:
+        return float('-inf')
+    try:
+        signal = signal - np.mean(signal)
+        filtered = bandpass_filter(signal, 0.5, 40.0, fs)
+        signal_power = np.var(filtered)
+        noise = signal - filtered
+        noise_power = np.var(noise)
+        if noise_power < 1e-10:
+            return 50.0
+        return 10 * np.log10(signal_power / noise_power)
+    except:
+        return float('-inf')
 
-    @staticmethod
-    def count_rpeaks_in_segment(segment: np.ndarray, fs: int) -> int:
-        if not NEUROKIT_AVAILABLE or len(segment) < fs:
-            return 0
-        try:
-            cleaned = nk.ecg_clean(segment, sampling_rate=fs)
-            _, rpeaks = nk.ecg_peaks(cleaned, sampling_rate=fs)
-            peaks = rpeaks.get('ECG_R_Peaks', np.array([]))
-            return len(peaks)
-        except Exception:
-            return 0
+def find_best_ecg_window(ecg_data, fs, window_sec=5.0):
+    """Find best quality ECG window"""
+    window_samples = int(window_sec * fs)
+    step_samples = int(0.25 * fs)
+    
+    print(f"[WINDOW] Searching {len(ecg_data)/fs:.1f}s for best {window_sec}s window")
+    
+    if len(ecg_data) < window_samples:
+        return 0, len(ecg_data), calculate_snr(ecg_data, fs), 0
+    
+    best_score = -999
+    best_idx = 0
+    best_snr = 0
+    best_peaks = 0
+    
+    for start in range(0, len(ecg_data) - window_samples + 1, step_samples):
+        end = start + window_samples
+        segment = ecg_data[start:end]
+        
+        snr = calculate_snr(segment, fs)
+        
+        # Count R-peaks using NeuroKit2
+        rpeak_count = 0
+        if NEUROKIT_AVAILABLE:
+            try:
+                cleaned = nk.ecg_clean(segment, sampling_rate=fs)
+                _, rpeaks_info = nk.ecg_peaks(cleaned, sampling_rate=fs)
+                peaks = rpeaks_info.get('ECG_R_Peaks', [])
+                rpeak_count = len(peaks)
+            except:
+                pass
+        
+        score = snr + (rpeak_count * 2)  # Bonus for R-peaks
+        
+        if score > best_score and rpeak_count >= MIN_RPEAKS:
+            best_score = score
+            best_idx = start
+            best_snr = snr
+            best_peaks = rpeak_count
+            
+    print(f"[WINDOW] Best: {best_idx/fs:.2f}s-{(best_idx+window_samples)/fs:.2f}s, SNR={best_snr:.1f}dB, R-peaks={best_peaks}")
+    return best_idx, best_idx + window_samples, best_snr, best_peaks
 
-    @staticmethod
-    def find_best_ecg_window(ecg_data: np.ndarray, fs: int, 
-                             min_rpeaks: int = 5,
-                             window_sec: float = 5.0, 
-                             step_sec: float = 0.25) -> tuple:
-        window_samples = int(window_sec * fs)
-        step_samples = int(step_sec * fs)
-        print(f"[ECG-WINDOW] Searching {len(ecg_data)} samples ({len(ecg_data)/fs:.1f}s)")
-        if len(ecg_data) < window_samples:
-            snr = SignalQualityAnalyzer.calculate_snr(ecg_data, fs)
-            rpeaks = SignalQualityAnalyzer.count_rpeaks_in_segment(ecg_data, fs)
-            return 0, len(ecg_data), snr, rpeaks
-        candidates = []
-        for start in range(0, len(ecg_data) - window_samples + 1, step_samples):
-            end = start + window_samples
-            segment = ecg_data[start:end]
-            snr = SignalQualityAnalyzer.calculate_snr(segment, fs)
-            rpeak_count = SignalQualityAnalyzer.count_rpeaks_in_segment(segment, fs)
-            if rpeak_count >= min_rpeaks:
-                candidates.append((start, end, snr, rpeak_count, snr))
-        if not candidates:
-            snr = SignalQualityAnalyzer.calculate_snr(ecg_data[:window_samples], fs)
-            rpeaks = SignalQualityAnalyzer.count_rpeaks_in_segment(ecg_data[:window_samples], fs)
-            return 0, window_samples, snr, rpeaks
-        candidates.sort(key=lambda x: x[4], reverse=True)
-        best = candidates[0]
-        print(f"[ECG-WINDOW] BEST: {best[0]/fs:.2f}s-{best[1]/fs:.2f}s, SNR: {best[2]:.1f}dB, R-peaks: {best[3]}")
-        return best[0], best[1], best[2], best[3]
-
-class ECGProcessor:
-    def __init__(self, fs: int = ECG_FS):
-        self.fs = fs
-
-    def process(self, ecg_uv: np.ndarray, sample_name: str = "", long_term_analysis: bool = False) -> dict:
-        print(f"\n{'='*70}")
-        print(f"[ECG-{sample_name}] {len(ecg_uv)} samples @ {self.fs} Hz ({len(ecg_uv)/self.fs:.2f}s)")
-        print(f"{'='*70}")
-        ecg_signal = np.array(ecg_uv, dtype=np.float64)
-        result = {
-            'sample_name': sample_name,
-            'duration_sec': len(ecg_uv) / self.fs,
-            'raw_uv': ecg_signal,
-            'raw_mv': ecg_signal / 1000.0,
-            'cleaned_uv': None,
-            'cleaned_mv': None,
-            'r_peaks': np.array([]),
-            'heart_rate': None,
-            'rr_intervals_ms': np.array([]),
-            'hrv_time': {},
-            'hrv_freq': {},
-            'hrv_nonlinear': {},
-            'waves': {},
-            'intervals': {},
-            'quality': None,
-            'analysis_method': 'none',
-        }
-        if not NEUROKIT_AVAILABLE:
-            result['cleaned_uv'] = ecg_signal
-            result['cleaned_mv'] = ecg_signal / 1000.0
-            return result
-        try:
-            cleaned = nk.ecg_clean(ecg_signal, sampling_rate=self.fs, method='neurokit')
-            result['cleaned_uv'] = cleaned
-            result['cleaned_mv'] = cleaned / 1000.0
-        except Exception as e:
-            print(f"[ECG] Clean failed: {e}")
-            cleaned = ecg_signal
-            result['cleaned_uv'] = ecg_signal
-            result['cleaned_mv'] = ecg_signal / 1000.0
-        try:
-            _, rpeaks_info = nk.ecg_peaks(cleaned, sampling_rate=self.fs)
-            r_peaks = np.array(rpeaks_info.get('ECG_R_Peaks', []))
-            result['r_peaks'] = r_peaks
-            print(f"[ECG] R-peaks: {len(r_peaks)}")
-        except Exception as e:
-            print(f"[ECG] Peak detection failed: {e}")
-            r_peaks = np.array([])
+def process_ecg(ecg_uv, fs):
+    """Process ECG using NeuroKit2"""
+    print(f"\n{'='*70}")
+    print(f"[ECG] Processing {len(ecg_uv)} samples @ {fs}Hz ({len(ecg_uv)/fs:.2f}s)")
+    print(f"{'='*70}")
+    
+    result = {
+        'raw_uv': ecg_uv,
+        'raw_mv': ecg_uv / 1000.0,
+        'cleaned_uv': None,
+        'cleaned_mv': None,
+        'r_peaks': np.array([]),
+        'heart_rate': None,
+        'rr_intervals_ms': np.array([]),
+        'hrv': {},
+        'waves': {},
+        'intervals': {},
+    }
+    
+    if not NEUROKIT_AVAILABLE:
+        result['cleaned_uv'] = ecg_uv
+        result['cleaned_mv'] = ecg_uv / 1000.0
+        return result
+    
+    # Clean
+    try:
+        cleaned = nk.ecg_clean(ecg_uv, sampling_rate=fs)
+        result['cleaned_uv'] = cleaned
+        result['cleaned_mv'] = cleaned / 1000.0
+        print(f"[ECG] Cleaned: {cleaned.min():.1f} to {cleaned.max():.1f} µV")
+    except Exception as e:
+        print(f"[ECG] Clean failed: {e}")
+        cleaned = ecg_uv
+        result['cleaned_uv'] = ecg_uv
+        result['cleaned_mv'] = ecg_uv / 1000.0
+    
+    # R-peaks
+    try:
+        _, rpeaks_info = nk.ecg_peaks(cleaned, sampling_rate=fs)
+        r_peaks = np.array(rpeaks_info.get('ECG_R_Peaks', []))
+        result['r_peaks'] = r_peaks
+        print(f"[ECG] R-peaks: {len(r_peaks)}")
+        
         if len(r_peaks) >= 2:
             rr_samples = np.diff(r_peaks)
-            rr_ms = rr_samples / self.fs * 1000
+            rr_ms = rr_samples / fs * 1000
             rr_valid = rr_ms[(rr_ms > 300) & (rr_ms < 2000)]
             result['rr_intervals_ms'] = rr_valid
+            
             if len(rr_valid) > 0:
                 hr_bpm = 60000 / rr_valid
                 result['heart_rate'] = {
@@ -460,124 +456,81 @@ class ECGProcessor:
                     'std': float(np.std(hr_bpm)),
                     'min': float(np.min(hr_bpm)),
                     'max': float(np.max(hr_bpm)),
-                    'values': hr_bpm
                 }
+                print(f"[ECG] HR: {result['heart_rate']['mean']:.1f} ± {result['heart_rate']['std']:.1f} bpm")
+    except Exception as e:
+        print(f"[ECG] Peak detection failed: {e}")
+    
+    # PQRST delineation
+    if len(r_peaks) >= 3:
         try:
-            signals_df, info = nk.ecg_process(cleaned, sampling_rate=self.fs)
-            result['analysis_method'] = 'neurokit2_full'
-            if 'ECG_Quality' in signals_df.columns:
-                quality = signals_df['ECG_Quality'].dropna().values
-                if len(quality) > 0:
-                    result['quality'] = float(np.mean(quality))
-        except Exception as e:
-            print(f"[ECG] Process failed: {e}")
-            result['analysis_method'] = 'neurokit2_partial'
-        if len(r_peaks) >= 3:
-            try:
-                _, waves = nk.ecg_delineate(cleaned, r_peaks, sampling_rate=self.fs, method='dwt')
-                result['waves'] = waves
-                self._calculate_intervals(result, waves, r_peaks)
-            except Exception as e:
-                print(f"[ECG] Delineation failed: {e}")
-        if len(r_peaks) >= 4:
-            self._calculate_hrv(result, r_peaks, long_term_analysis)
-        print(f"[ECG-{sample_name}] Complete")
-        return result
-
-    def _calculate_intervals(self, result: dict, waves: dict, r_peaks: np.ndarray):
-        try:
+            _, waves = nk.ecg_delineate(cleaned, r_peaks, sampling_rate=fs, method='dwt')
+            result['waves'] = waves
+            
+            # Calculate intervals
             intervals = {}
+            
+            # PR interval
             p_onsets = waves.get('ECG_P_Onsets', [])
-            q_peaks = waves.get('ECG_Q_Peaks', [])
-            s_peaks = waves.get('ECG_S_Peaks', [])
-            t_offsets = waves.get('ECG_T_Offsets', [])
             pr_vals = []
             for i, r in enumerate(r_peaks):
                 if i < len(p_onsets) and p_onsets[i] is not None and not np.isnan(p_onsets[i]):
-                    pr = (r - p_onsets[i]) / self.fs * 1000
+                    pr = (r - p_onsets[i]) / fs * 1000
                     if 80 < pr < 300:
                         pr_vals.append(pr)
             if pr_vals:
                 intervals['PR_Interval'] = float(np.mean(pr_vals))
+            
+            # QRS duration
+            q_peaks = waves.get('ECG_Q_Peaks', [])
+            s_peaks = waves.get('ECG_S_Peaks', [])
             qrs_vals = []
             for i in range(len(r_peaks)):
                 if i < len(q_peaks) and i < len(s_peaks):
                     q, s = q_peaks[i], s_peaks[i]
                     if q is not None and s is not None and not np.isnan(q) and not np.isnan(s):
-                        qrs = (s - q) / self.fs * 1000
+                        qrs = (s - q) / fs * 1000
                         if 40 < qrs < 200:
                             qrs_vals.append(qrs)
             if qrs_vals:
                 intervals['QRS_Duration'] = float(np.mean(qrs_vals))
+            
+            # QT interval
+            t_offsets = waves.get('ECG_T_Offsets', [])
             qt_vals = []
             for i in range(len(r_peaks)):
                 if i < len(q_peaks) and i < len(t_offsets):
                     q, t = q_peaks[i], t_offsets[i]
                     if q is not None and t is not None and not np.isnan(q) and not np.isnan(t):
-                        qt = (t - q) / self.fs * 1000
+                        qt = (t - q) / fs * 1000
                         if 200 < qt < 600:
                             qt_vals.append(qt)
             if qt_vals:
                 intervals['QT_Interval'] = float(np.mean(qt_vals))
-                if result.get('heart_rate') and result['heart_rate'].get('mean'):
+                if result.get('heart_rate'):
                     hr = result['heart_rate']['mean']
                     rr_sec = 60.0 / hr
                     intervals['QTc'] = float(intervals['QT_Interval'] / np.sqrt(rr_sec))
+            
             result['intervals'] = intervals
+            print(f"[ECG] Intervals: {len(intervals)} calculated")
         except Exception as e:
-            print(f"[ECG] Interval calc error: {e}")
-
-    def _calculate_hrv(self, result: dict, r_peaks: np.ndarray, long_term_analysis: bool = False):
-        print(f"[ECG] HRV Analysis with {len(r_peaks)} R-peaks... (Long-term: {long_term_analysis})")
+            print(f"[ECG] Delineation failed: {e}")
+    
+    # HRV
+    if len(r_peaks) >= 4:
         try:
-            hrv_time = nk.hrv_time(r_peaks, sampling_rate=self.fs, show=False)
-            time_metrics = ['HRV_MeanNN', 'HRV_SDNN', 'HRV_RMSSD', 'HRV_pNN50', 'HRV_pNN20',
-                          'HRV_SDSD', 'HRV_CVNN', 'HRV_MedianNN', 'HRV_MadNN', 'HRV_CVSD']
-            for m in time_metrics:
-                if m in hrv_time.columns:
-                    val = hrv_time[m].values[0]
-                    if val is not None and not np.isnan(val) and not np.isinf(val):
-                        result['hrv_time'][m] = float(val)
+            hrv_time = nk.hrv_time(r_peaks, sampling_rate=fs, show=False)
+            for col in ['HRV_MeanNN', 'HRV_SDNN', 'HRV_RMSSD', 'HRV_pNN50']:
+                if col in hrv_time.columns:
+                    val = hrv_time[col].values[0]
+                    if val is not None and not np.isnan(val):
+                        result['hrv'][col] = float(val)
+            print(f"[ECG] HRV: {len(result['hrv'])} metrics")
         except Exception as e:
-            print(f"[ECG] HRV Time failed: {e}")
-        if long_term_analysis:
-            duration_sec = len(result['raw_uv']) / self.fs
-            if duration_sec >= 60 and len(r_peaks) >= 30:
-                try:
-                    hrv_freq = nk.hrv_frequency(r_peaks, sampling_rate=self.fs, show=False)
-                    freq_metrics = ['HRV_VLF', 'HRV_LF', 'HRV_HF', 'HRV_LFHF', 'HRV_LFn', 'HRV_HFn', 
-                                   'HRV_TP', 'HRV_LnHF']
-                    for m in freq_metrics:
-                        if m in hrv_freq.columns:
-                            val = hrv_freq[m].values[0]
-                            if val is not None and not np.isnan(val) and not np.isinf(val) and val > 0:
-                                result['hrv_freq'][m] = float(val)
-                    print(f"[ECG] HRV Freq: {len(result['hrv_freq'])} metrics")
-                except Exception as e:
-                    print(f"[ECG] HRV Freq failed: {e}")
-            else:
-                print(f"[ECG] HRV Freq skipped: need 60s+ ({duration_sec:.0f}s available)")
-        else:
-            print(f"[ECG] HRV Freq skipped: Short-term analysis only (Sample 1)")
-        if long_term_analysis and len(r_peaks) >= 10:
-            try:
-                hrv_nl = nk.hrv_nonlinear(r_peaks, sampling_rate=self.fs, show=False)
-                nl_metrics = ['HRV_SD1', 'HRV_SD2', 'HRV_SD1SD2', 'HRV_ApEn', 'HRV_SampEn', 
-                             'HRV_DFA_alpha1', 'HRV_DFA_alpha2', 'HRV_MFDFA_alpha1_Width',
-                             'HRV_MSE']
-                for m in nl_metrics:
-                    if m in hrv_nl.columns:
-                        val = hrv_nl[m].values[0]
-                        if val is not None and not np.isnan(val) and not np.isinf(val):
-                            result['hrv_nonlinear'][m] = float(val)
-                print(f"[ECG] HRV Nonlinear: {len(result['hrv_nonlinear'])} metrics")
-            except Exception as e:
-                print(f"[ECG] HRV Nonlinear failed: {e}")
-        else:
-            if not long_term_analysis:
-                print(f"[ECG] HRV Nonlinear skipped: Short-term analysis only (Sample 1)")
-            else:
-                print(f"[ECG] HRV Nonlinear skipped: need 10+ R-peaks ({len(r_peaks)} available)")
+            print(f"[ECG] HRV failed: {e}")
+    
+    return result
 
 def process_ppg(red_data, ir_data, fs, patient_height_m=1.70):
     """Process PPG with Age Index, PAT, Respiration Rate"""
@@ -597,7 +550,8 @@ def process_ppg(red_data, ir_data, fs, patient_height_m=1.70):
         'perfusion_index': None,
         'age_index': None,
         'respiration_rate': None,
-        'baseline_shift': {},
+        'baseline_shift_ir': {},
+        'baseline_shift_red': {},
     }
     
     # Preprocess IR
@@ -756,41 +710,45 @@ def process_ppg(red_data, ir_data, fs, patient_height_m=1.70):
         except Exception as e:
             print(f"[PPG] Respiration failed: {e}")
     
-    # Baseline Shift Analysis and Tracking
+    # Baseline Shift Analysis for IR
     try:
-        # Linear trend for IR
         x = np.arange(len(ir_filtered))
-        coeffs_ir = np.polyfit(x, ir_filtered, 1)
-        drift_per_sample_ir = coeffs_ir[0]
-        drift_per_sec_ir = drift_per_sample_ir * fs
-        trend_line_ir = np.polyval(coeffs_ir, x)
-        detrended_sig_ir = ir_filtered - trend_line_ir
-        std_dev_ir = np.std(detrended_sig_ir)
-        drift_magnitude_ir = np.max(ir_filtered) - np.min(ir_filtered)
-        result['baseline_ir'] = trend_line_ir
-
-        # Linear trend for Red
-        coeffs_red = np.polyfit(x, red_filtered, 1)
-        drift_per_sample_red = coeffs_red[0]
-        drift_per_sec_red = drift_per_sample_red * fs
-        trend_line_red = np.polyval(coeffs_red, x)
-        detrended_sig_red = red_filtered - trend_line_red
-        std_dev_red = np.std(detrended_sig_red)
-        drift_magnitude_red = np.max(red_filtered) - np.min(red_filtered)
-        result['baseline_red'] = trend_line_red
-
-        result['baseline_shift'] = {
-            'drift_per_sec_ir': drift_per_sec_ir,
-            'std_deviation_ir': std_dev_ir,
-            'drift_magnitude_ir': drift_magnitude_ir,
-            'drift_per_sec_red': drift_per_sec_red,
-            'std_deviation_red': std_dev_red,
-            'drift_magnitude_red': drift_magnitude_red,
+        coeffs = np.polyfit(x, ir_filtered, 1)
+        drift_per_sample = coeffs[0]
+        drift_per_sec = drift_per_sample * fs
+        trend_line = np.polyval(coeffs, x)
+        detrended_sig = ir_filtered - trend_line
+        std_dev = np.std(detrended_sig)
+        drift_magnitude = np.max(ir_filtered) - np.min(ir_filtered)
+        
+        result['baseline_shift_ir'] = {
+            'drift_per_sec': drift_per_sec,
+            'std_deviation': std_dev,
+            'drift_magnitude': drift_magnitude,
         }
-        print(f"[PPG] Baseline IR: drift={drift_per_sec_ir:.3f}/s, std={std_dev_ir:.2f}")
-        print(f"[PPG] Baseline Red: drift={drift_per_sec_red:.3f}/s, std={std_dev_red:.2f}")
+        print(f"[PPG] IR Baseline: drift={drift_per_sec:.3f}/s, std={std_dev:.2f}")
     except Exception as e:
-        print(f"[PPG] Baseline analysis failed: {e}")
+        print(f"[PPG] IR Baseline analysis failed: {e}")
+    
+    # Baseline Shift Analysis for Red
+    try:
+        x = np.arange(len(red_filtered))
+        coeffs = np.polyfit(x, red_filtered, 1)
+        drift_per_sample = coeffs[0]
+        drift_per_sec = drift_per_sample * fs
+        trend_line = np.polyval(coeffs, x)
+        detrended_sig = red_filtered - trend_line
+        std_dev = np.std(detrended_sig)
+        drift_magnitude = np.max(red_filtered) - np.min(red_filtered)
+        
+        result['baseline_shift_red'] = {
+            'drift_per_sec': drift_per_sec,
+            'std_deviation': std_dev,
+            'drift_magnitude': drift_magnitude,
+        }
+        print(f"[PPG] Red Baseline: drift={drift_per_sec:.3f}/s, std={std_dev:.2f}")
+    except Exception as e:
+        print(f"[PPG] Red Baseline analysis failed: {e}")
     
     return result
 
@@ -798,27 +756,29 @@ def calculate_pat(ecg_r_peaks, ppg_peaks, ecg_fs, ppg_fs):
     """Calculate Pulse Arrival Time"""
     if len(ecg_r_peaks) < 2 or len(ppg_peaks) < 2:
         return None
-
+    
     # Convert peak indices to time
     ecg_times = ecg_r_peaks / ecg_fs
     ppg_times = ppg_peaks / ppg_fs
-
+    
     pat_values = []
-    ppg_idx = 0
+    
     for r_time in ecg_times:
-        # Find the first PPG peak after this R-peak
-        while ppg_idx < len(ppg_times) and ppg_times[ppg_idx] < r_time:
-            ppg_idx += 1
-        if ppg_idx < len(ppg_times):
-            pat = (ppg_times[ppg_idx] - r_time) * 1000.0  # ms
-            if 50 < pat < 500:  # physiologically plausible
+        # Find next PPG peak after this R-peak
+        later_ppg = ppg_times[ppg_times > r_time]
+        if len(later_ppg) > 0:
+            ppg_time = later_ppg[0]
+            pat = (ppg_time - r_time) * 1000  # Convert to ms
+            
+            # Physiological range: 80-400ms
+            if 80 < pat < 400:
                 pat_values.append(pat)
-
+    
     if len(pat_values) >= 2:
         avg_pat = np.mean(pat_values)
         print(f"[PAT] Pulse Arrival Time: {avg_pat:.1f}ms")
         return avg_pat
-
+    
     return None
 
 # ============================================================================
@@ -857,30 +817,19 @@ class ReportGenerator(QThread):
                 self.finished.emit(False, "Insufficient ECG data (need 3+ seconds)")
                 return
 
-            # ============== ECG ANALYSIS ==============
-            self.progress.emit("Analyzing ECG Sample 1 (Best Quality)...")
-            start1, end1, snr1, rpeak_cnt1 = SignalQualityAnalyzer.find_best_ecg_window(
-                self.ecg_data, ECG_FS, min_rpeaks=MIN_RPEAKS
-            )
-            ecg_sample1 = self.ecg_data[start1:end1]
-            ecg_processor = ECGProcessor(ECG_FS)
-            ecg_result1 = ecg_processor.process(ecg_sample1, "Sample1", long_term_analysis=False)
+            self.progress.emit("Finding best ECG window...")
+            start_idx, end_idx, snr, rpeak_count = find_best_ecg_window(self.ecg_data, ECG_FS)
+            ecg_window = self.ecg_data[start_idx:end_idx]
+            
+            self.progress.emit("Analyzing ECG...")
+            ecg_result = process_ecg(ecg_window, ECG_FS)
 
-            # Sample 2: Full recording - COMPLETE LONG-TERM ANALYSIS
-            ecg_result2 = None
-            total_duration = len(self.ecg_data) / ECG_FS
-            if total_duration >= 60:
-                self.progress.emit("Analyzing ECG Sample 2 (Full Recording - Long-term)...")
-                ecg_result2 = ecg_processor.process(self.ecg_data, "Sample2", long_term_analysis=True)
-
-            # ============== PPG ANALYSIS ==============
-            ppg_result1 = None
-            ppg_result2 = None
+            ppg_result = None
+            pat = None
             if self.ppg_ir_data is not None and self.ppg_red_data is not None:
-                ppg_total_duration = len(self.ppg_ir_data) / PPG_FS
-                # Sample 1: FULL PPG RECORDING - BASIC ANALYSIS ONLY (no window selection)
-                if ppg_total_duration >= 5:
-                    self.progress.emit("Analyzing PPG Sample 1 (Full Recording - Basic)...")
+                if len(self.ppg_ir_data) > PPG_FS * 5:
+                    self.progress.emit("Analyzing PPG...")
+                    
                     # Get patient height if available
                     height_m = 1.70  # default
                     if 'Height' in self.patient_info:
@@ -890,15 +839,37 @@ class ReportGenerator(QThread):
                                 height_m = height_cm / 100.0
                         except:
                             pass
-                    ppg_result1 = process_ppg(self.ppg_red_data, self.ppg_ir_data, PPG_FS, height_m)
-                    # Sample 2: Full recording - COMPLETE LONG-TERM ANALYSIS (same data, different analysis depth)
-                    if ppg_total_duration >= 60:
-                        self.progress.emit("Analyzing PPG Sample 2 (Full Recording - Long-term)...")
-                        ppg_result2 = process_ppg(self.ppg_red_data, self.ppg_ir_data, PPG_FS, height_m)
+                    
+                    ppg_result = process_ppg(self.ppg_red_data, self.ppg_ir_data, PPG_FS, height_m)
+                    
+                    # Calculate PAT using only PPG peaks that lie within the ECG window time range
+                    if len(ecg_result['r_peaks']) >= 2 and len(ppg_result['ir_peaks']) >= 2:
+                        self.progress.emit("Calculating PAT...")
+                        
+                        # Time range of the selected ECG window
+                        ecg_start_time = start_idx / ECG_FS
+                        ecg_end_time = end_idx / ECG_FS
+                        
+                        # Filter PPG peaks to those within the ECG window
+                        ppg_peak_times = ppg_result['ir_peaks'] / PPG_FS
+                        mask = (ppg_peak_times >= ecg_start_time) & (ppg_peak_times <= ecg_end_time)
+                        ppg_peaks_in_window = ppg_result['ir_peaks'][mask]
+                        
+                        # ECG R-peaks are already within the window, convert to global indices
+                        ecg_global_peaks = ecg_result['r_peaks'] + start_idx
+                        
+                        pat = calculate_pat(
+                            ecg_global_peaks,
+                            ppg_peaks_in_window,
+                            ECG_FS,
+                            PPG_FS
+                        )
+                        if pat:
+                            ppg_result['pat'] = pat
 
             self.progress.emit("Generating PDF report...")
-            self._create_pdf(ecg_result1, ecg_result2, ppg_result1, ppg_result2,
-                           start1, end1, snr1, rpeak_cnt1)
+            self._create_pdf(ecg_result, ppg_result, start_idx, end_idx, snr)
+            
             self.finished.emit(True, self.output_path)
 
         except Exception as e:
@@ -928,12 +899,9 @@ class ReportGenerator(QThread):
                 s = str(row).strip()
                 if s.startswith('[') and s.endswith(']'):
                     s = s[1:-1]
-                    # Only use the first value before the |
-                    first_val = s.split('|')[0].strip()
-                    if first_val:
-                        samples.append(float(first_val))
+                    samples.extend([float(x) for x in s.split('|') if x.strip()])
             return np.array(samples, dtype=np.float64) if samples else None
-        except Exception as e:
+        except:
             return None
 
     def _load_patient_info(self, filepath):
@@ -961,32 +929,33 @@ class ReportGenerator(QThread):
             ax.axhline(y, color='#ffaaaa', lw=0.5, zorder=0)
         ax.axhline(0, color='#ff8888', lw=0.8, zorder=0)
 
-    def _create_pdf(self, ecg_result1, ecg_result2, ppg_result1, ppg_result2, start_idx, end_idx, snr, rpeak_count):
+    def _create_pdf(self, ecg_result, ppg_result, start_idx, end_idx, snr):
         plt = self.plt
+        
         with self.PdfPages(self.output_path) as pdf:
             # Page 1: Cover
-            self._page_cover(pdf, plt, ecg_result1, ppg_result1, snr)
-
+            self._page_cover(pdf, plt, ecg_result, ppg_result, snr)
+            
             # Page 2: ECG Medical Grid with R-peaks and intervals
-            self._page_ecg_medical(pdf, plt, ecg_result1)
-
+            self._page_ecg_medical(pdf, plt, ecg_result)
+            
             # Page 3: ECG PQRST Labeled Beats
-            self._page_ecg_pqrst(pdf, plt, ecg_result1)
-
+            self._page_ecg_pqrst(pdf, plt, ecg_result)
+            
             # Page 4: ECG HRV Analysis
-            if ecg_result1.get('hrv'):
-                self._page_ecg_hrv(pdf, plt, ecg_result1)
-
+            if ecg_result.get('hrv'):
+                self._page_ecg_hrv(pdf, plt, ecg_result)
+            
             # Page 5: PPG Signal with Peaks
-            if ppg_result1:
-                self._page_ppg_signals(pdf, plt, ppg_result1)
-
+            if ppg_result:
+                self._page_ppg_signals(pdf, plt, ppg_result)
+            
             # Page 6: PPG Analysis (SpO2, Age Index, PAT, Respiration)
-            if ppg_result1:
-                self._page_ppg_analysis(pdf, plt, ppg_result1)
-
-            # Page 7: Summary (full recording)
-            self._page_summary(pdf, plt, ecg_result2, ppg_result2)
+            if ppg_result:
+                self._page_ppg_analysis(pdf, plt, ppg_result)
+            
+            # Page 7: Summary
+            self._page_summary(pdf, plt, ecg_result, ppg_result)
 
     def _page_cover(self, pdf, plt, ecg_result, ppg_result, snr):
         fig = plt.figure(figsize=(11, 8.5))
@@ -1306,197 +1275,188 @@ class ReportGenerator(QThread):
         plt.close(fig)
 
     def _page_ppg_signals(self, pdf, plt, ppg_result):
-        """PPG signals with peaks labeled and baseline tracking"""
-        fig, axes = plt.subplots(4, 1, figsize=(11, 11))
+        """PPG signals with peaks and baseline tracking for both IR and Red"""
+        fig = plt.figure(figsize=(11, 8.5))
         fig.suptitle('PPG Signal Analysis', fontsize=14, fontweight='bold')
-
+        
+        # Create gridspec: 3 rows, 2 columns
+        gs = self.gridspec.GridSpec(3, 2, figure=fig, height_ratios=[1.2, 1.2, 1])
+        
         ir_raw = ppg_result['ir_raw']
         red_raw = ppg_result['red_raw']
         ir_filtered = ppg_result.get('ir_filtered', ir_raw)
         red_filtered = ppg_result.get('red_filtered', red_raw)
         ir_peaks = ppg_result.get('ir_peaks', np.array([]))
         red_peaks = ppg_result.get('red_peaks', np.array([]))
-        baseline_ir = ppg_result.get('baseline_ir', None)
-        baseline_red = ppg_result.get('baseline_red', None)
-
+        
         window = min(len(ir_raw), PPG_FS * 15)
         t = np.arange(window) / PPG_FS
-
-        # IR Channel
-        ax = axes[0]
+        
+        # IR Channel (row 0, col 0-1)
+        ax = fig.add_subplot(gs[0, :])
         ax.plot(t, ir_raw[:window], 'purple', lw=0.8, alpha=0.4, label='Raw IR')
         ax.plot(t, ir_filtered[:window], 'b-', lw=1.2, label='Filtered IR')
         peaks_win = ir_peaks[ir_peaks < window]
         if len(peaks_win) > 0:
-            ax.plot(t[peaks_win], ir_filtered[peaks_win], 'ro', label='IR Peaks')
+            ax.scatter(peaks_win/PPG_FS, ir_filtered[peaks_win], 
+                      color='red', s=80, marker='v', zorder=10, label='Peaks')
         ax.set_xlabel('Time (s)')
-        ax.set_ylabel('IR Amplitude')
-        ax.legend()
-        ax.set_title('IR Channel')
-
-        # Red Channel
-        ax = axes[1]
-        ax.plot(t, red_raw[:window], 'darkred', lw=0.8, alpha=0.4, label='Raw Red')
-        ax.plot(t, red_filtered[:window], 'r-', lw=1.2, label='Filtered Red')
+        ax.set_ylabel('ADC Counts')
+        ax.set_title(f'IR Channel - {len(ir_peaks)} peaks detected')
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        
+        # Red Channel (row 1, col 0-1)
+        ax = fig.add_subplot(gs[1, :])
+        ax.plot(t, red_raw[:window], 'red', lw=0.8, alpha=0.4, label='Raw Red')
+        ax.plot(t, red_filtered[:window], 'darkred', lw=1.2, label='Filtered Red')
         peaks_win = red_peaks[red_peaks < window]
         if len(peaks_win) > 0:
-            ax.plot(t[peaks_win], red_filtered[peaks_win], 'go', label='Red Peaks')
+            ax.scatter(peaks_win/PPG_FS, red_filtered[peaks_win], 
+                      color='green', s=80, marker='v', zorder=10, label='Peaks')
         ax.set_xlabel('Time (s)')
-        ax.set_ylabel('Red Amplitude')
-        ax.legend()
-        ax.set_title('Red Channel')
-
-        # Baseline Tracking IR
-        ax = axes[2]
-        ax.plot(t, ir_filtered[:window], 'b-', lw=1, alpha=0.5, label='Filtered IR')
-        if baseline_ir is not None:
-            ax.plot(t, baseline_ir[:window], 'k--', lw=1.2, label='IR Baseline')
-        ax.set_xlabel('Time (s)')
-        ax.set_ylabel('IR Baseline')
-        ax.legend()
-        ax.set_title('IR Baseline Tracking')
-
-        # Baseline Tracking Red
-        ax = axes[3]
-        ax.plot(t, red_filtered[:window], 'r-', lw=1, alpha=0.5, label='Filtered Red')
-        if baseline_red is not None:
-            ax.plot(t, baseline_red[:window], 'k--', lw=1.2, label='Red Baseline')
-        ax.set_xlabel('Time (s)')
-        ax.set_ylabel('Red Baseline')
-        ax.legend()
-        ax.set_title('Red Baseline Tracking')
-
+        ax.set_ylabel('ADC Counts')
+        ax.set_title(f'Red Channel - {len(red_peaks)} peaks detected')
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        
+        # Baseline Shift IR (row 2, col 0)
+        ax = fig.add_subplot(gs[2, 0])
+        if 'baseline_shift_ir' in ppg_result and ppg_result['baseline_shift_ir']:
+            x = np.arange(len(ir_filtered))
+            coeffs = np.polyfit(x, ir_filtered, 1)
+            trend_line = np.polyval(coeffs, x)
+            detrended = ir_filtered - trend_line
+            
+            t_full = np.arange(len(ir_filtered)) / PPG_FS
+            ax.plot(t_full, ir_filtered, 'b-', lw=0.8, alpha=0.5, label='Original')
+            ax.plot(t_full, trend_line, 'r--', lw=2, label='Trend')
+            ax.plot(t_full, detrended, 'g-', lw=0.8, label='Detrended')
+            
+            bs = ppg_result['baseline_shift_ir']
+            info = f"Drift: {bs['drift_per_sec']:.3f}/s\nStd: {bs['std_deviation']:.2f}"
+            ax.text(0.02, 0.98, info, transform=ax.transAxes, fontsize=9, va='top',
+                   bbox=dict(boxstyle='round', fc='lightyellow', alpha=0.9))
+            
+            ax.set_xlabel('Time (s)')
+            ax.set_ylabel('ADC Counts')
+            ax.set_title('IR Baseline Shift')
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
+        else:
+            ax.text(0.5, 0.5, 'IR baseline analysis\nnot available', 
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.axis('off')
+        
+        # Baseline Shift Red (row 2, col 1)
+        ax = fig.add_subplot(gs[2, 1])
+        if 'baseline_shift_red' in ppg_result and ppg_result['baseline_shift_red']:
+            x = np.arange(len(red_filtered))
+            coeffs = np.polyfit(x, red_filtered, 1)
+            trend_line = np.polyval(coeffs, x)
+            detrended = red_filtered - trend_line
+            
+            t_full = np.arange(len(red_filtered)) / PPG_FS
+            ax.plot(t_full, red_filtered, 'r-', lw=0.8, alpha=0.5, label='Original')
+            ax.plot(t_full, trend_line, 'k--', lw=2, label='Trend')
+            ax.plot(t_full, detrended, 'orange', lw=0.8, label='Detrended')
+            
+            bs = ppg_result['baseline_shift_red']
+            info = f"Drift: {bs['drift_per_sec']:.3f}/s\nStd: {bs['std_deviation']:.2f}"
+            ax.text(0.02, 0.98, info, transform=ax.transAxes, fontsize=9, va='top',
+                   bbox=dict(boxstyle='round', fc='lightyellow', alpha=0.9))
+            
+            ax.set_xlabel('Time (s)')
+            ax.set_ylabel('ADC Counts')
+            ax.set_title('Red Baseline Shift')
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
+        else:
+            ax.text(0.5, 0.5, 'Red baseline analysis\nnot available', 
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.axis('off')
+        
         plt.tight_layout()
         pdf.savefig(fig, bbox_inches='tight')
         plt.close(fig)
 
     def _page_ppg_analysis(self, pdf, plt, ppg_result):
-        """PPG analysis: SpO2, Age Index, PAT, Respiration, Frequency, Segmentation"""
-        import neurokit2 as nk
-        fig = plt.figure(figsize=(15, 12))
-        fig.suptitle('PPG Advanced Analysis', fontsize=16, fontweight='bold')
-        gs = self.gridspec.GridSpec(3, 3, figure=fig)
-
-        # 1. SpO2
+        """PPG analysis: SpO2, Age Index, PAT, Respiration"""
+        fig = plt.figure(figsize=(11, 8.5))
+        fig.suptitle('PPG Advanced Analysis', fontsize=14, fontweight='bold')
+        
+        gs = self.gridspec.GridSpec(2, 2, figure=fig)
+        
+        # SpO2
         ax = fig.add_subplot(gs[0, 0])
         ax.axis('off')
-        ax.text(0.5, 0.95, 'Oxygen Saturation', fontsize=12, fontweight='bold', ha='center', transform=ax.transAxes)
+        ax.text(0.5, 0.95, 'Oxygen Saturation', fontsize=12, fontweight='bold', 
+               ha='center', transform=ax.transAxes)
         spo2 = ppg_result.get('spo2')
         if spo2:
             color = 'green' if spo2 >= 95 else ('orange' if spo2 >= 90 else 'red')
-            ax.text(0.5, 0.6, f'{spo2:.1f}%', fontsize=48, fontweight='bold', ha='center', transform=ax.transAxes, color=color)
+            ax.text(0.5, 0.6, f'{spo2}%', fontsize=48, fontweight='bold', 
+                   ha='center', transform=ax.transAxes, color=color)
             ax.text(0.5, 0.35, 'SpO2', fontsize=14, ha='center', transform=ax.transAxes)
+            
+            pi = ppg_result.get('perfusion_index')
+            if pi:
+                ax.text(0.5, 0.2, f'Perfusion Index: {pi:.2f}%', fontsize=10, 
+                       ha='center', transform=ax.transAxes, color='gray')
         else:
-            ax.text(0.5, 0.5, 'SpO2\nnot available', ha='center', va='center', transform=ax.transAxes, fontsize=14, color='gray')
-
-        # 2. Age Index
+            ax.text(0.5, 0.5, 'SpO2\nnot available', ha='center', va='center',
+                   transform=ax.transAxes, fontsize=14, color='gray')
+        
+        # Age Index (Stiffness)
         ax = fig.add_subplot(gs[0, 1])
         ax.axis('off')
-        ax.text(0.5, 0.95, 'Age Index (Stiffness)', fontsize=12, fontweight='bold', ha='center', transform=ax.transAxes)
+        ax.text(0.5, 0.95, 'Age Index (Stiffness)', fontsize=12, fontweight='bold', 
+               ha='center', transform=ax.transAxes)
         age_idx = ppg_result.get('age_index')
         if age_idx:
-            ax.text(0.5, 0.6, f'{age_idx:.2f}', fontsize=42, fontweight='bold', ha='center', transform=ax.transAxes, color='purple')
+            ax.text(0.5, 0.6, f'{age_idx:.2f}', fontsize=42, fontweight='bold', 
+                   ha='center', transform=ax.transAxes, color='purple')
             ax.text(0.5, 0.4, 'm/s', fontsize=14, ha='center', transform=ax.transAxes)
+            ax.text(0.5, 0.25, 'Arterial Stiffness Index', fontsize=10, 
+                   ha='center', transform=ax.transAxes, style='italic', color='gray')
+            ax.text(0.5, 0.15, '(Height / ΔT_dicrotic)', fontsize=9, 
+                   ha='center', transform=ax.transAxes, color='gray')
         else:
-            ax.text(0.5, 0.5, 'Age Index\nnot available', ha='center', va='center', transform=ax.transAxes, fontsize=14, color='gray')
-
-        # 3. PAT
-        ax = fig.add_subplot(gs[0, 2])
+            ax.text(0.5, 0.5, 'Age Index\nnot available', ha='center', va='center',
+                   transform=ax.transAxes, fontsize=14, color='gray')
+        
+        # PAT
+        ax = fig.add_subplot(gs[1, 0])
         ax.axis('off')
-        ax.text(0.5, 0.95, 'Pulse Arrival Time', fontsize=12, fontweight='bold', ha='center', transform=ax.transAxes)
+        ax.text(0.5, 0.95, 'Pulse Arrival Time', fontsize=12, fontweight='bold', 
+               ha='center', transform=ax.transAxes)
         pat = ppg_result.get('pat')
         if pat:
-            ax.text(0.5, 0.6, f'{pat:.1f}', fontsize=42, fontweight='bold', ha='center', transform=ax.transAxes, color='teal')
+            ax.text(0.5, 0.6, f'{pat:.1f}', fontsize=42, fontweight='bold', 
+                   ha='center', transform=ax.transAxes, color='teal')
             ax.text(0.5, 0.4, 'ms', fontsize=14, ha='center', transform=ax.transAxes)
+            ax.text(0.5, 0.25, 'ECG R-peak to PPG peak', fontsize=10, 
+                   ha='center', transform=ax.transAxes, style='italic', color='gray')
         else:
-            ax.text(0.5, 0.5, 'PAT\nnot available', ha='center', va='center', transform=ax.transAxes, fontsize=14, color='gray')
-
-        # 4. Frequency change plot (IR)
-        ir_peaks = ppg_result.get('ir_peaks', np.array([]))
-        ax = fig.add_subplot(gs[1, 0])
-        ax.set_title('IR Instantaneous Frequency')
-        if len(ir_peaks) > 1:
-            ir_pp_intervals = np.diff(ir_peaks) / PPG_FS
-            ir_freq = 1.0 / ir_pp_intervals
-            ax.plot(ir_peaks[1:] / PPG_FS, ir_freq, 'b.-', label='IR Freq (Hz)')
-            ax.set_ylabel('Frequency (Hz)')
-            ax.set_xlabel('Time (s)')
-            ax.legend()
-        else:
-            ax.text(0.5, 0.5, 'Not enough IR peaks', ha='center', va='center', transform=ax.transAxes)
-
-        # 5. Frequency change plot (Red)
-        red_peaks = ppg_result.get('red_peaks', np.array([]))
+            ax.text(0.5, 0.5, 'PAT\nnot available', ha='center', va='center',
+                   transform=ax.transAxes, fontsize=14, color='gray')
+        
+        # Respiration Rate
         ax = fig.add_subplot(gs[1, 1])
-        ax.set_title('Red Instantaneous Frequency')
-        if len(red_peaks) > 1:
-            red_pp_intervals = np.diff(red_peaks) / PPG_FS
-            red_freq = 1.0 / red_pp_intervals
-            ax.plot(red_peaks[1:] / PPG_FS, red_freq, 'r.-', label='Red Freq (Hz)')
-            ax.set_ylabel('Frequency (Hz)')
-            ax.set_xlabel('Time (s)')
-            ax.legend()
-        else:
-            ax.text(0.5, 0.5, 'Not enough Red peaks', ha='center', va='center', transform=ax.transAxes)
-
-        # 6. Segmentation and labeling of 5 PPG beats (IR)
-        ir_filtered = ppg_result.get('ir_filtered', None)
-        ax = fig.add_subplot(gs[1, 2])
-        ax.set_title('IR Beat Segmentation (5 beats)')
-        if ir_filtered is not None and len(ir_peaks) >= 6:
-            for i in range(5):
-                start = int(ir_peaks[i])
-                end = int(ir_peaks[i+1])
-                beat = ir_filtered[start:end]
-                t_beat = np.arange(len(beat)) / PPG_FS
-                ax.plot(t_beat, beat, label=f'Beat {i+1}')
-            ax.legend()
-            ax.set_xlabel('Time (s)')
-            ax.set_ylabel('Amplitude')
-        else:
-            ax.text(0.5, 0.5, 'Not enough IR beats', ha='center', va='center', transform=ax.transAxes)
-
-        # 7. Segmentation and labeling of 5 PPG beats (Red)
-        red_filtered = ppg_result.get('red_filtered', None)
-        ax = fig.add_subplot(gs[2, 0])
-        ax.set_title('Red Beat Segmentation (5 beats)')
-        if red_filtered is not None and len(red_peaks) >= 6:
-            for i in range(5):
-                start = int(red_peaks[i])
-                end = int(red_peaks[i+1])
-                beat = red_filtered[start:end]
-                t_beat = np.arange(len(beat)) / PPG_FS
-                ax.plot(t_beat, beat, label=f'Beat {i+1}')
-            ax.legend()
-            ax.set_xlabel('Time (s)')
-            ax.set_ylabel('Amplitude')
-        else:
-            ax.text(0.5, 0.5, 'Not enough Red beats', ha='center', va='center', transform=ax.transAxes)
-
-        # 8. Respiration Rate
-        ax = fig.add_subplot(gs[2, 1])
         ax.axis('off')
-        ax.text(0.5, 0.95, 'Respiration Rate', fontsize=12, fontweight='bold', ha='center', transform=ax.transAxes)
+        ax.text(0.5, 0.95, 'Respiration Rate', fontsize=12, fontweight='bold', 
+               ha='center', transform=ax.transAxes)
         resp = ppg_result.get('respiration_rate')
         if resp:
-            ax.text(0.5, 0.6, f'{resp:.1f}', fontsize=42, fontweight='bold', ha='center', transform=ax.transAxes, color='darkgreen')
+            ax.text(0.5, 0.6, f'{resp:.1f}', fontsize=42, fontweight='bold', 
+                   ha='center', transform=ax.transAxes, color='darkgreen')
             ax.text(0.5, 0.4, 'breaths/min', fontsize=14, ha='center', transform=ax.transAxes)
+            ax.text(0.5, 0.25, 'From PPG amplitude modulation', fontsize=10, 
+                   ha='center', transform=ax.transAxes, style='italic', color='gray')
         else:
-            ax.text(0.5, 0.5, 'Respiration\nnot available', ha='center', va='center', transform=ax.transAxes, fontsize=12, color='gray')
-
-        # 9. Baseline tracking summary
-        ax = fig.add_subplot(gs[2, 2])
-        ax.axis('off')
-        ax.text(0.5, 0.95, 'Baseline Tracking', fontsize=12, fontweight='bold', ha='center', transform=ax.transAxes)
-        bs = ppg_result.get('baseline_shift', {})
-        txt = ''
-        if bs:
-            txt += f"IR Drift: {bs.get('drift_per_sec_ir', 0):.3f}/s\nIR Std: {bs.get('std_deviation_ir', 0):.2f}\n"
-            txt += f"Red Drift: {bs.get('drift_per_sec_red', 0):.3f}/s\nRed Std: {bs.get('std_deviation_red', 0):.2f}"
-        else:
-            txt = 'Not available'
-        ax.text(0.5, 0.5, txt, ha='center', va='center', transform=ax.transAxes, fontsize=12)
-
+            ax.text(0.5, 0.5, 'Respiration\nnot available\n(requires 30s+ signal)', 
+                   ha='center', va='center', transform=ax.transAxes, fontsize=12, color='gray')
+        
         plt.tight_layout()
         pdf.savefig(fig, bbox_inches='tight')
         plt.close(fig)
@@ -1515,29 +1475,25 @@ class ReportGenerator(QThread):
                transform=ax.transAxes, color='#2060a0')
         y -= 0.03
         
-        if ecg_result is None:
-            ax.text(0.07, y, 'No ECG data available.', fontsize=10, transform=ax.transAxes, color='red')
-            y -= 0.03
-        else:
-            hr = ecg_result.get('heart_rate') if ecg_result is not None else None
-            if hr:
-                ax.text(0.07, y, 'Heart Rate:', fontsize=10, transform=ax.transAxes)
-                ax.text(0.35, y, f'{hr["mean"]:.1f} ± {hr["std"]:.1f} bpm', fontsize=10, 
+        hr = ecg_result.get('heart_rate')
+        if hr:
+            ax.text(0.07, y, 'Heart Rate:', fontsize=10, transform=ax.transAxes)
+            ax.text(0.35, y, f'{hr["mean"]:.1f} ± {hr["std"]:.1f} bpm', fontsize=10, 
+                   fontfamily='monospace', transform=ax.transAxes)
+            y -= 0.025
+        
+        intervals = ecg_result.get('intervals', {})
+        for k in ['PR_Interval', 'QRS_Duration', 'QTc']:
+            if k in intervals:
+                ax.text(0.07, y, f'{k.replace("_", " ")}:', fontsize=10, transform=ax.transAxes)
+                ax.text(0.35, y, f'{intervals[k]:.0f} ms', fontsize=10, 
                        fontfamily='monospace', transform=ax.transAxes)
                 y -= 0.025
-
-            intervals = ecg_result.get('intervals', {}) if ecg_result is not None else {}
-            for k in ['PR_Interval', 'QRS_Duration', 'QTc']:
-                if k in intervals:
-                    ax.text(0.07, y, f'{k.replace("_", " ")}:', fontsize=10, transform=ax.transAxes)
-                    ax.text(0.35, y, f'{intervals[k]:.0f} ms', fontsize=10, 
-                           fontfamily='monospace', transform=ax.transAxes)
-                    y -= 0.025
-
-            hrv = ecg_result.get('hrv', {}) if ecg_result is not None else {}
-            for k in ['HRV_SDNN', 'HRV_RMSSD']:
-                if k in hrv:
-                    ax.text(0.07, y, f'{k}:', fontsize=10, transform=ax.transAxes)
+        
+        hrv = ecg_result.get('hrv', {})
+        for k in ['HRV_SDNN', 'HRV_RMSSD']:
+            if k in hrv:
+                ax.text(0.07, y, f'{k}:', fontsize=10, transform=ax.transAxes)
                 ax.text(0.35, y, f'{hrv[k]:.1f}', fontsize=10, 
                        fontfamily='monospace', transform=ax.transAxes)
                 y -= 0.025

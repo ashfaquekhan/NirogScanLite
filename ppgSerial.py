@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-PPG Analysis System using pyPPG Library
-Clean implementation with comprehensive biomarker extraction
-"""
-
 import sys
 import serial
 import numpy as np

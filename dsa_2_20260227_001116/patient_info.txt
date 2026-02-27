@@ -1,6 +1,0 @@
-Name: dsa
-Age: 2
-Gender: Male
-Weight: N/A
-Height: N/A
-Notes: None

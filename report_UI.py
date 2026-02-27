@@ -191,20 +191,19 @@ class ECGProcessor:
     
     @staticmethod
     def calculate_snr(signal, fs):
+        # simple time-domain SNR estimate; avoid heavy filtering
         try:
-            if len(signal) < fs:
+            sig = np.asarray(signal)
+            if len(sig) < fs:
                 return float('nan')
-            centered = signal - np.mean(signal)
-            nyq = fs / 2
-            lo, hi = 0.5 / nyq, min(40, nyq * 0.8) / nyq
-            if lo >= hi:
-                return float('nan')
-            b, a = butter(3, [lo, hi], btype='band')
-            sig_band = filtfilt(b, a, centered)
-            sig_pow = np.var(sig_band)
-            noise_pow = np.var(np.diff(centered))
-            return 10 * np.log10(sig_pow / noise_pow) if noise_pow > 0 else float('inf')
-        except:
+            centered = sig - np.mean(sig)
+            sig_power = np.var(centered)
+            noise_est = np.var(np.diff(centered)) if len(centered) > 1 else 0
+            if noise_est > 0:
+                return 10 * np.log10(sig_power / noise_est)
+            else:
+                return float('inf')
+        except Exception:
             return float('nan')
 
 # ============================================================================

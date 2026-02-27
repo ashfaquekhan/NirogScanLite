@@ -17,7 +17,7 @@ conda activate nirogscan_py310
 
 ## Step 2: Install Dependencies
 ```bash
-# Install from requirements.txt
+# Install from requirements.txt (includes biosppy/peakutils for ECG processing)
 pip install -r requirements.txt
 
 # Verify critical packages
@@ -70,6 +70,14 @@ pyinstaller --onefile --console --name=report_app --collect-all=bleak --collect-
 ```bash
 pip install bleak-winrt --force-reinstall
 python -c "import winrt.windows.foundation.collections; print('OK')"
+```
+
+### Issue: "ModuleNotFoundError: peakutils" or biosppy import failure
+**Solution**: 
+```bash
+pip install biosppy peakutils
+# or rerun
+pip install -r requirements.txt
 ```
 
 ### Issue: "IMPORT_HARD_UNITTEST" error

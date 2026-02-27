@@ -8,3 +8,7 @@ scipy
 pywt 
 pandas 
 matplotlib
+
+# signal-processing / ECG requirements
+biosppy
+peakutils
